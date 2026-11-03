@@ -81,17 +81,27 @@ class STTService:
             if lang_code != "en":
                 language = lang_code
 
-        params = urlencode({
-            "model": model,
-            "language": language,
-            "interim_results": "true",
-            "vad_events": "true",
-            "endpointing": str(endpointing),
-            "smart_format": "true",
-            "encoding": encoding,
-            "sample_rate": sample_rate,
-            "channels": "1",
-        })
+        query_items = [
+            ("model", model),
+            ("language", language),
+            ("interim_results", "true"),
+            ("vad_events", "true"),
+            ("endpointing", str(endpointing)),
+            ("smart_format", "true"),
+            ("encoding", encoding),
+            ("sample_rate", sample_rate),
+            ("channels", "1"),
+            ("keywords", "MetaBull:3"),
+            ("keywords", "Universe:2"),
+            ("keywords", "GetAiPilot:2"),
+            ("keywords", "Voice Pilot:2"),
+            ("keywords", "WhatsApp Pilot:2"),
+            ("keywords", "Social Pilot:2"),
+            ("keywords", "website:2"),
+            ("keywords", "video:2"),
+            ("keywords", "automation:2"),
+        ]
+        params = urlencode(query_items)
         url = f"wss://api.deepgram.com/v1/listen?{params}"
         headers = {"Authorization": f"Token {self.api_key}"}
 

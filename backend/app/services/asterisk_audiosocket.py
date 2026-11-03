@@ -728,7 +728,7 @@ class AsteriskVoiceSession:
                 }
 
                 def is_only_greeting(text: str) -> bool:
-                    clean_text = re.sub(r'[^\w\s]', ' ', text).lower()
+                    clean_text = re.sub(r'[^\w\s\u0900-\u097F]', ' ', text).lower()
                     words_list = clean_text.split()
                     if not words_list:
                         return True
@@ -749,20 +749,24 @@ class AsteriskVoiceSession:
                     if num_words == 0:
                         return False
 
-                    text = ' '.join(words_list)
-                    if is_first_chunk and is_only_greeting(text):
-                        return False
-
                     last_word = words_list[-1]
+
+                    # Complete sentence ending (. ? ! ।)
                     if ends_with_sentence_punc(last_word):
                         return True
 
-                    if ends_with_pause_punc(last_word) and num_words > 18 and not is_protected_word(last_word):
-                        return True
-
-                    # Upper safety fallback limit
-                    if num_words >= 28 and not is_protected_word(last_word):
-                        return True
+                    # Fast First Chunk: release at pause punctuation after 4 words, or 8 words total
+                    if is_first_chunk:
+                        if ends_with_pause_punc(last_word) and num_words >= 4:
+                            return True
+                        if num_words >= 8 and not is_protected_word(last_word):
+                            return True
+                    else:
+                        # Subsequent chunks: release at pause punctuation after 8 words, or 16 words max
+                        if ends_with_pause_punc(last_word) and num_words >= 8 and not is_protected_word(last_word):
+                            return True
+                        if num_words >= 16 and not is_protected_word(last_word):
+                            return True
 
                     return False
 
@@ -878,73 +882,49 @@ class AsteriskVoiceSession:
                 async def playback_worker():
                     nonlocal playback_offset, playback_buffer
 
-                    lwm_800ms = int(8000 * 2 * 0.8) # 12,800 bytes
-                    lwm_400ms = int(8000 * 2 * 0.4) # 6,400 bytes
-
-                    logger.info(f"[AudioSocket] Playback buffering: waiting for LWM conditions...")
-
-                    playback_started_logged = False
+                    # 200ms fast-start prebuffer (3,200 bytes) instead of 800ms stall
+                    prebuffer_bytes = int(8000 * 2 * 0.20)
                     next_playback_idx = 0
 
                     while not self.barge_in_event.is_set():
                         if next_playback_idx in synthesized_audio:
                             pcm = synthesized_audio[next_playback_idx]
-
                             if next_playback_idx not in sentence_played_time:
                                 sentence_played_time[next_playback_idx] = time.time()
-                                wait_ms = int((sentence_played_time[next_playback_idx] - tts_finish_time[next_playback_idx]) * 1000)
-                                logger.info(f"[Pipeline] Sentence {next_playback_idx} reached Playback [Audio Queue Wait Time: {wait_ms}ms]")
-
                             playback_buffer.extend(pcm)
                             del synthesized_audio[next_playback_idx]
                             next_playback_idx += 1
 
                         buffered_available = len(playback_buffer) - playback_offset
-
                         accumulator_done = (
                             sentence_queue.empty() 
                             and next_playback_idx > max_built_idx
                             and not synthesized_audio
                         )
 
-                        sentence_1_ready = (playback_offset == 0 and len(playback_buffer) > 0)
-                        sentence_2_generating = (max_built_idx >= 1)
-
                         if (
-                            buffered_available >= lwm_800ms 
-                            or (sentence_1_ready and sentence_2_generating)
-                            or (accumulator_done and buffered_available > 0)
+                            buffered_available >= prebuffer_bytes 
+                            or accumulator_done 
+                            or (playback_offset == 0 and len(playback_buffer) > 0)
                         ):
-                            if not playback_started_logged:
-                                playback_started_logged = True
-                                logger.info(
-                                    f"[Pipeline] Playback Start [Playback Buffer Size: {buffered_available} bytes "
-                                    f"({int(buffered_available/16)}ms)], sentence_1_ready={sentence_1_ready}, "
-                                    f"sentence_2_generating={sentence_2_generating}, accumulator_done={accumulator_done}"
-                                )
+                            logger.info(f"[Pipeline] Playback Start [Buffer: {buffered_available} bytes (~{int(buffered_available/16)}ms)]")
                             break
-                        await asyncio.sleep(0.02)
+                        await asyncio.sleep(0.01)
 
-                    # Absolute-deadline pacing for streaming mode.
-                    # Initialize NOW so first frame goes immediately without overshoot.
                     next_send_time = time.monotonic()
-                    underflow_count = 0
+                    consecutive_underflows = 0
+                    frame_count = 0
 
                     while not self.barge_in_event.is_set():
-                        if next_playback_idx in synthesized_audio:
+                        while next_playback_idx in synthesized_audio:
                             pcm = synthesized_audio[next_playback_idx]
-
                             if next_playback_idx not in sentence_played_time:
                                 sentence_played_time[next_playback_idx] = time.time()
-                                wait_ms = int((sentence_played_time[next_playback_idx] - tts_finish_time[next_playback_idx]) * 1000)
-                                logger.info(f"[Pipeline] Sentence {next_playback_idx} reached Playback [Audio Queue Wait Time: {wait_ms}ms]")
-
                             playback_buffer.extend(pcm)
                             del synthesized_audio[next_playback_idx]
                             next_playback_idx += 1
 
                         buffered_available = len(playback_buffer) - playback_offset
-
                         accumulator_done = (
                             sentence_queue.empty() 
                             and next_playback_idx > max_built_idx
@@ -955,45 +935,19 @@ class AsteriskVoiceSession:
                             if accumulator_done:
                                 logger.info(f"[Pipeline] Playback complete for call {self.call_uuid}")
                                 break
+
+                            consecutive_underflows += 1
+                            if consecutive_underflows <= 5:
+                                # Comfort silence packet (20ms) keeps AudioSocket clock in lockstep without 400ms pause
+                                chunk = b'\x00' * 320
                             else:
-                                logger.warning(
-                                    f"[Pipeline] Playback Underflow: available={buffered_available} bytes, "
-                                    f"next_playback_idx={next_playback_idx}, max_built_idx={max_built_idx}"
-                                )
-                                # Pause playback and wait for LWM 400ms
-                                while not self.barge_in_event.is_set():
-                                    if next_playback_idx in synthesized_audio:
-                                        pcm = synthesized_audio[next_playback_idx]
-                                        playback_buffer.extend(pcm)
-                                        del synthesized_audio[next_playback_idx]
-                                        next_playback_idx += 1
-
-                                    buffered_available = len(playback_buffer) - playback_offset
-                                    accumulator_done = (
-                                        sentence_queue.empty() 
-                                        and next_playback_idx > max_built_idx
-                                        and not synthesized_audio
-                                    )
-                                    if buffered_available >= lwm_400ms or accumulator_done:
-                                        underflow_count += 1
-                                        logger.info(
-                                            f"[Pipeline] Resuming playback after underflow pause: available={buffered_available} bytes "
-                                            f"(total_underflows={underflow_count})"
-                                        )
-                                        if underflow_count >= 3:
-                                            logger.warning(
-                                                f"[Pipeline] HIGH UNDERFLOW RATE: {underflow_count} underflows so far — "
-                                                f"Sarvam TTS may not be keeping up with real-time. "
-                                                f"Consider increasing pre-buffer (lwm_800ms) or checking Sarvam latency."
-                                            )
-                                        # CRITICAL: reset deadline after waiting to avoid burst-send catch-up
-                                        next_send_time = time.monotonic()
-                                        break
-                                    await asyncio.sleep(0.05)
+                                await asyncio.sleep(0.01)
+                                next_send_time = time.monotonic()
                                 continue
-
-                        chunk = bytes(playback_buffer[playback_offset:playback_offset+320])
-                        playback_offset += 320
+                        else:
+                            consecutive_underflows = 0
+                            chunk = bytes(playback_buffer[playback_offset:playback_offset+320])
+                            playback_offset += 320
 
                         if self._state != 'speaking':
                             self.set_state('speaking')
@@ -1007,6 +961,9 @@ class AsteriskVoiceSession:
                         packet = bytes([0x10]) + len(chunk).to_bytes(2, "big") + chunk
                         async with self._writer_lock:
                             self.writer.write(packet)
+
+                        frame_count += 1
+                        if frame_count % 10 == 0:
                             try:
                                 await self.writer.drain()
                             except Exception as e:
@@ -1015,10 +972,10 @@ class AsteriskVoiceSession:
 
                         next_send_time += 0.02
                         remaining = next_send_time - time.monotonic()
-                        if remaining > 0:
+                        if remaining > 0.002:
                             await asyncio.sleep(remaining)
-                        else:
-                            # Fallen behind: resync to avoid burst-sending on catch-up
+                        elif remaining < -0.050:
+                            # Compensate for OS scheduling drift
                             next_send_time = time.monotonic()
 
                 # 5. Pipeline Visualization Task
@@ -1125,24 +1082,46 @@ class AsteriskVoiceSession:
                     if not transcript:
                         continue
 
-                    # If the bot is actively speaking, handle barge-in (interruption)
+                    clean_text = re.sub(r'[^\w\s\u0900-\u097F]', '', transcript).strip()
+                    if not clean_text:
+                        continue
+
+                    words = clean_text.split()
+
+                    # 1. BARGE-IN (When bot is actively speaking)
                     if self.is_speaking():
-                        clean_text = re.sub(r'[^\w\s]', '', transcript).strip()
-                        if not clean_text:
-                            continue
                         elapsed_speaking = time.time() - self.speaking_started_at
-                        if elapsed_speaking > 1.5:
-                            logger.info(f'[Barge-In] Interrupting after {elapsed_speaking:.1f}s: "{transcript}"')
+                        # Echo guard: ignore first 400ms to reject acoustic echo from speaker
+                        if elapsed_speaking < 0.4:
+                            continue
+
+                        # Priority interruption words that trigger immediate barge-in
+                        PRIORITY_INTERRUPT = {
+                            "stop", "ruko", "suno", "wait", "nahi", "no", "hello", "arre", "ek", "minute"
+                        }
+                        is_priority = any(w.lower() in PRIORITY_INTERRUPT for w in words)
+
+                        # Require at least 2 distinct words or priority keyword (rejects background clicks/noise)
+                        if is_priority or len(words) >= 2:
+                            logger.info(f'[Barge-In] Valid interruption ({len(words)} words, elapsed={elapsed_speaking:.1f}s): "{transcript}"')
                             self.barge_in_event.set()
                             await self.cancel_llm_tts()
                         continue
 
-                    # Bot is idle (listening) — trigger LLM on final speech
+                    # 2. TURN DETECTION (When bot is listening / idle)
                     if event_type in (EVT_SPEECH_FINAL, EVT_FINAL):
-                        clean_text = re.sub(r'[^\w\s]', '', transcript).strip()
-                        if not clean_text:
+                        # Detect trailing conjunctions/connectors to avoid cutting off mid-clause
+                        TRAILING_CONNECTORS = {
+                            "का", "की", "के", "में", "से", "और", "या", "तो", "लेकिन", "कि", "भी",
+                            "and", "or", "to", "of", "for", "with", "because"
+                        }
+                        last_w = words[-1].lower() if words else ""
+                        if last_w in TRAILING_CONNECTORS:
+                            logger.info(f"[STT] Incomplete clause ending in '{last_w}', waiting for continuation: '{transcript}'")
+                            await asyncio.sleep(0.35)
                             continue
-                        logger.info(f'[STT] User speech completed: "{transcript}"')
+
+                        logger.info(f'[STT] User speech turn finalized: "{transcript}"')
                         logger.transcript_final(transcript, 1.0, 0)
                         await self.cancel_llm_tts()
                         self.llm_tts_task = asyncio.create_task(

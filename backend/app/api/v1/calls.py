@@ -384,7 +384,7 @@ async def test_call(
             "caller_id": from_number or "unknown",
             "dialed_number": to_number,
             "direction": "outbound",
-            "status": "dialing",
+            "status": "created",
             "provider": "asterisk",
             "sip_trunk_provider_id": trunk_id,
             "metadata": {"provider": "asterisk", "is_test": True}

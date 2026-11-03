@@ -20,10 +20,12 @@ def execute_asterisk_cli(asterisk_cmd: str) -> Dict[str, Any]:
 
 
 def is_audiosocket_listening() -> bool:
-    """Checks if a TCP listener is active on 127.0.0.1:9092."""
+    """Checks if a TCP listener is active on AudioSocket port."""
     import socket
+    host = settings.asterisk_audiosocket_host or "127.0.0.1"
+    port = settings.asterisk_audiosocket_port or 9092
     try:
-        with socket.create_connection(("127.0.0.1", 9092), timeout=1.0) as s:
+        with socket.create_connection((host, int(port)), timeout=1.0) as s:
             return True
     except Exception:
         return False
@@ -382,7 +384,7 @@ async def test_call(
             "caller_id": from_number or "unknown",
             "dialed_number": to_number,
             "direction": "outbound",
-            "status": "ringing",
+            "status": "dialing",
             "provider": "asterisk",
             "sip_trunk_provider_id": trunk_id,
             "metadata": {"provider": "asterisk", "is_test": True}
@@ -409,18 +411,19 @@ async def test_call(
             provider_type = "custom"
             
         if provider_type != "twilio":
+            # 24IThub and Indian SIP trunks require 91XXXXXXXXXX without '+' prefix
             if dial_number.startswith('+'):
-                if dial_number.startswith('+91'):
-                    dial_number = dial_number[1:]
-                    
-        # Ensure dial_number has '+' prefix
-        if not dial_number.startswith('+'):
-            dial_number = '+' + dial_number
+                dial_number = dial_number[1:]
+        else:
+            if not dial_number.startswith('+'):
+                dial_number = '+' + dial_number
                 
         endpoint_name = f"provider-{trunk_id}"
-        caller_id = from_number or "+18166536732"
+        caller_id = from_number or "911168140253"
+        if caller_id.startswith('+'):
+            caller_id = caller_id[1:]
 
-        originate_cmd_str = f"asterisk -rx 'channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:9092'"
+        originate_cmd_str = f"asterisk -rx 'channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}'"
 
         call_originated = False
 
@@ -431,7 +434,7 @@ async def test_call(
                 if not is_audiosocket_listening():
                     raise HTTPException(
                         status_code=503,
-                        detail="AudioSocket server is not listening on 127.0.0.1:9092. Please make sure the local backend is running."
+                        detail="AudioSocket server is not listening on AudioSocket port. Please make sure the local backend is running."
                     )
                     
                 # 2. Preemptive validation: PJSIP endpoint existence
@@ -449,7 +452,7 @@ async def test_call(
                     )
                     
                 # 3. Execute local originate command directly (no SSH fallback, return errors)
-                originate_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:9092"
+                originate_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}"
                 res = execute_asterisk_cli(originate_cmd)
                 if res["returncode"] != 0:
                     raise HTTPException(
@@ -527,7 +530,7 @@ async def test_call(
                         ssh_cmd += ["-i", ssh_key]
                     ssh_cmd += [
                         f"{ssh_user}@{ssh_host}",
-                        f"asterisk -rx 'channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:9092'"
+                        f"asterisk -rx 'channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}'"
                     ]
                     try:
                         # Increased timeout to 60 seconds to accommodate network/routing latency
@@ -544,10 +547,10 @@ async def test_call(
                 if not call_originated:
                     import platform
                     if platform.system() == "Windows":
-                        orig_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:9092"
+                        orig_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}"
                         cmd = ["wsl", "-u", "root", "bash", "-c", f"asterisk -rx {shlex.quote(orig_cmd)}"]
                     else:
-                        cmd = ["asterisk", "-rx", f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:9092"]
+                        cmd = ["asterisk", "-rx", f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}"]
                     try:
                         # Increased timeout to 60 seconds to accommodate slow WSL start/execution latency
                         res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -909,7 +912,7 @@ async def asterisk_outbound_call(body: Dict[str, Any], db: Client = Depends(get_
     endpoint_name = f"provider-{trunk_id}"
     caller_id = from_number or "+18166536732"
 
-    orig_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_uuid},127.0.0.1:9092"
+    orig_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_uuid},127.0.0.1:{settings.asterisk_audiosocket_port}"
 
     call_originated = False
 
@@ -919,7 +922,7 @@ async def asterisk_outbound_call(body: Dict[str, Any], db: Client = Depends(get_
             if not is_audiosocket_listening():
                 raise HTTPException(
                     status_code=503,
-                    detail="AudioSocket server is not listening on 127.0.0.1:9092. Please make sure the local backend is running."
+                    detail="AudioSocket server is not listening on AudioSocket port. Please make sure the local backend is running."
                 )
                 
             # 2. Endpoint validation
@@ -1071,7 +1074,7 @@ async def test_local_originate(payload: Dict[str, Any]):
             pass
 
     t_id = provider.replace("provider-", "") if provider.startswith("provider-") else provider
-    orig_cmd = f"channel originate Local/{caller}*{t_id}*{dial_number}@outbound-local/n application AudioSocket {call_uuid},127.0.0.1:9092"
+    orig_cmd = f"channel originate Local/{caller}*{t_id}*{dial_number}@outbound-local/n application AudioSocket {call_uuid},127.0.0.1:{settings.asterisk_audiosocket_port}"
 
     
     # Execute command

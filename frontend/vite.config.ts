@@ -22,12 +22,12 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://72.60.202.148:8020',
+        target: 'https://asterisk.getaipilot.com',
         changeOrigin: true,
         secure: false,
       },
       '/ws': {
-        target: 'http://72.60.202.148:8020',
+        target: 'https://asterisk.getaipilot.com',
         ws: true,
         changeOrigin: true,
       },

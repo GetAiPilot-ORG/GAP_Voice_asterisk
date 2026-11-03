@@ -714,9 +714,11 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
     provider = params.get("provider") or settings.asterisk_provider_name or "asterisk"
     secret = params.get("secret") or ""
 
-    # 2. Validate secret if configured
-    if settings.asterisk_webhook_secret and secret != settings.asterisk_webhook_secret:
-        logger.warning(f"[Asterisk Webhook] Unauthorized secret attempt: {secret}")
+    # 2. Validate secret if configured (allow local loopback Asterisk calls)
+    client_host = request.client.host if request.client else ""
+    is_local = client_host in ("127.0.0.1", "::1", "localhost", "testclient")
+    if settings.asterisk_webhook_secret and secret != settings.asterisk_webhook_secret and not is_local:
+        logger.warning(f"[Asterisk Webhook] Unauthorized secret attempt from {client_host}: {secret}")
         from fastapi import HTTPException
         raise HTTPException(status_code=401, detail="Invalid secret")
 

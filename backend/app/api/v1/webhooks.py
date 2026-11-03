@@ -819,10 +819,8 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
 
     # 6. Create call record for allowed call
     try:
-        import uuid
-        db_call_id = str(uuid.uuid4())
         insert_payload = {
-            "id": db_call_id,
+            "id": call_uuid,
             "call_uuid": call_uuid,
             "twilio_call_sid": call_uuid,
             "workspace_id": workspace_id,
@@ -866,10 +864,8 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
 
 async def _create_rejected_call_record(db, call_uuid, workspace_id, agent_id, phone_id, is_did, provider, caller_id, dialed_number, reason):
     try:
-        import uuid
-        db_call_id = str(uuid.uuid4())
         insert_payload = {
-            "id": db_call_id,
+            "id": call_uuid,
             "call_uuid": call_uuid,
             "twilio_call_sid": call_uuid,
             "workspace_id": workspace_id,

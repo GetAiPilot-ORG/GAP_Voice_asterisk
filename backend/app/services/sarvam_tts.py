@@ -367,7 +367,7 @@ class WarmSarvamConnection:
                     if msg_type == "audio":
                         audio_b64 = msg.get("data", {}).get("audio", "")
                         if audio_b64:
-                            audio_chunks.append(base64.b64decode(audio_b64))
+                            yield base64.b64decode(audio_b64)
                     elif msg_type == "flushed":
                         break
                     elif msg_type == "event":
@@ -388,8 +388,8 @@ class WarmSarvamConnection:
                 self._connect_task = None
                 raise
 
-        for chunk in audio_chunks:
-            yield chunk
+        # Streamed in real-time above
+        pass
 
     async def close(self) -> None:
         if self._ws and self._ws.state == websockets.State.OPEN:

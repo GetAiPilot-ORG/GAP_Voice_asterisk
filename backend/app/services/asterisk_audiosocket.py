@@ -1025,7 +1025,7 @@ class AsteriskVoiceSession:
                 async def pipeline_visualizer():
                     nonlocal playback_offset, playback_buffer
                     start_viz = time.time()
-                    while not self.barge_in_event.is_set():
+                    while not self.barge_in_event.is_set() and not playback_task.done():
                         await asyncio.sleep(0.2)
                         elapsed = time.time() - start_viz
 
@@ -1062,7 +1062,9 @@ class AsteriskVoiceSession:
 
                 self.tts_tasks = [reader_task, chunker_task, tts_w1, tts_w2, playback_task, visualizer_task]
 
-                await asyncio.gather(reader_task, chunker_task, tts_w1, tts_w2, playback_task, visualizer_task)
+                await asyncio.gather(reader_task, chunker_task, tts_w1, tts_w2, playback_task)
+                if not visualizer_task.done():
+                    visualizer_task.cancel()
                 self.set_state('idle')
                 self.messages.append({'role': 'assistant', 'content': full_response})
                 elapsed = int((time.time() - pipeline_start) * 1000)
@@ -1115,40 +1117,37 @@ class AsteriskVoiceSession:
                 if event_type == EVT_SPEECH_STARTED:
                     continue
 
-                elif event_type in (EVT_INTERIM, EVT_FINAL):
-                    # Do NOT barge-in while greeting is active or state is not 'speaking'
+                elif event_type in (EVT_INTERIM, EVT_FINAL, EVT_SPEECH_FINAL):
                     if self.greeting_active:
                         continue
+
                     transcript = payload.get('transcript', '').strip()
-                    if not self.is_speaking():
-                        continue
                     if not transcript:
                         continue
 
-                    clean_text = re.sub(r'[^\w\s]', '', transcript).strip()
-                    if not clean_text:
+                    # If the bot is actively speaking, handle barge-in (interruption)
+                    if self.is_speaking():
+                        clean_text = re.sub(r'[^\w\s]', '', transcript).strip()
+                        if not clean_text:
+                            continue
+                        elapsed_speaking = time.time() - self.speaking_started_at
+                        if elapsed_speaking > 1.5:
+                            logger.info(f'[Barge-In] Interrupting after {elapsed_speaking:.1f}s: "{transcript}"')
+                            self.barge_in_event.set()
+                            await self.cancel_llm_tts()
                         continue
 
-                    elapsed_speaking = time.time() - self.speaking_started_at
-                    # Guard: require at least 3 seconds before barge-in is allowed
-                    if elapsed_speaking > 3.0:
-                        logger.info(f'[Barge-In] Interrupting after {elapsed_speaking:.1f}s: "{transcript}"')
-                        self.barge_in_event.set()
+                    # Bot is idle (listening) — trigger LLM on final speech
+                    if event_type in (EVT_SPEECH_FINAL, EVT_FINAL):
+                        clean_text = re.sub(r'[^\w\s]', '', transcript).strip()
+                        if not clean_text:
+                            continue
+                        logger.info(f'[STT] User speech completed: "{transcript}"')
+                        logger.transcript_final(transcript, 1.0, 0)
                         await self.cancel_llm_tts()
-
-                elif event_type == EVT_SPEECH_FINAL:
-                    # Do NOT process caller speech during greeting
-                    if self.greeting_active:
-                        logger.info(f'[STT] Speech final received during greeting, ignoring: "{payload.get("transcript", "")}"')
-                        continue
-                    transcript = payload.get('transcript', '').strip()
-                    if not transcript:
-                        continue
-                    logger.transcript_final(transcript, 1.0, 0)
-                    await self.cancel_llm_tts()
-                    self.llm_tts_task = asyncio.create_task(
-                        self.run_llm_tts_pipeline(transcript)
-                    )
+                        self.llm_tts_task = asyncio.create_task(
+                            self.run_llm_tts_pipeline(transcript)
+                        )
 
                 elif event_type == EVT_UTTERANCE_END:
                     continue

@@ -345,7 +345,7 @@ function AgentsPage() {
     setTestCalling(true);
     setTestCallResult(null);
     setCallTime(0);
-    setCallRecord({ status: "ringing" }); // set initial local status to switch views
+    setCallRecord({ status: "dialing" }); // set initial local status to switch views
     const targetNumber = testCallNumber.trim();
     const fullNumber = targetNumber.startsWith("+") ? targetNumber : `${countryCode}${targetNumber}`;
     try {

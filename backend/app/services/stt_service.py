@@ -70,7 +70,7 @@ class STTService:
         self,
         audio_queue: "asyncio.Queue[bytes | None]",
         language: str = "en-US",
-        endpointing: int = 300,
+        endpointing: int = 500,
         model: str = "nova-2",
         encoding: str = "linear16",
         sample_rate: str = "16000",
@@ -91,16 +91,24 @@ class STTService:
             ("encoding", encoding),
             ("sample_rate", sample_rate),
             ("channels", "1"),
-            ("keywords", "MetaBull:3"),
-            ("keywords", "Universe:2"),
-            ("keywords", "GetAiPilot:2"),
-            ("keywords", "Voice Pilot:2"),
-            ("keywords", "WhatsApp Pilot:2"),
-            ("keywords", "Social Pilot:2"),
-            ("keywords", "website:2"),
-            ("keywords", "video:2"),
-            ("keywords", "automation:2"),
         ]
+
+        # Nova-3 requires 'keyterm', while Nova-2 requires 'keywords'
+        kw_param = "keyterm" if "nova-3" in model.lower() else "keywords"
+        boosted_terms = [
+            ("MetaBull", 3),
+            ("Universe", 2),
+            ("GetAiPilot", 2),
+            ("Voice Pilot", 2),
+            ("WhatsApp Pilot", 2),
+            ("Social Pilot", 2),
+            ("website", 2),
+            ("video", 2),
+            ("automation", 2),
+        ]
+        for term, boost in boosted_terms:
+            val = term if kw_param == "keyterm" else f"{term}:{boost}"
+            query_items.append((kw_param, val))
         params = urlencode(query_items)
         url = f"wss://api.deepgram.com/v1/listen?{params}"
         headers = {"Authorization": f"Token {self.api_key}"}

@@ -708,19 +708,22 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
         if k not in params:
             params[k] = v
 
+    from app.utils.audio_telephony import mask_phone_number
     caller_id = params.get("caller_id") or params.get("caller") or ""
     dialed_number = params.get("dialed_number") or params.get("dialed") or ""
     call_uuid = params.get("call_uuid") or params.get("uuid") or ""
     provider = params.get("provider") or settings.asterisk_provider_name or "asterisk"
-    secret = params.get("secret") or ""
-
-    # 2. Validate secret if configured (allow local loopback Asterisk calls)
-    client_host = request.client.host if request.client else ""
-    is_local = client_host in ("127.0.0.1", "::1", "localhost", "testclient")
-    if settings.asterisk_webhook_secret and secret != settings.asterisk_webhook_secret and not is_local:
-        logger.warning(f"[Asterisk Webhook] Unauthorized secret attempt from {client_host}: {secret}")
+    
+    # 2. Explicit internal secret validation (query param or X-Asterisk-Internal-Secret header)
+    secret_header = request.headers.get("X-Asterisk-Internal-Secret")
+    provided_secret = params.get("secret") or secret_header or ""
+    if settings.asterisk_webhook_secret and provided_secret != settings.asterisk_webhook_secret:
+        client_host = request.client.host if request.client else "unknown"
+        logger.warning(f"[Asterisk Webhook] Unauthorized secret attempt from {client_host}")
         from fastapi import HTTPException
         raise HTTPException(status_code=401, detail="Invalid secret")
+    
+    logger.info(f"[Asterisk Webhook] Inbound call trigger: caller={mask_phone_number(caller_id)}, DID={mask_phone_number(dialed_number)}, uuid={call_uuid}")
 
     if not call_uuid:
         from fastapi import HTTPException
@@ -819,10 +822,8 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
 
     # 6. Create call record for allowed call
     try:
-        import uuid
-        db_call_id = str(uuid.uuid4())
         insert_payload = {
-            "id": db_call_id,
+            "id": call_uuid,
             "call_uuid": call_uuid,
             "twilio_call_sid": call_uuid,
             "workspace_id": workspace_id,
@@ -844,8 +845,14 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
             insert_payload["phone_number_id"] = phone_id
             insert_payload["did_number_id"] = None
 
-        await asyncio.to_thread(db.table("calls").insert(insert_payload).execute)
-        logger.info(f"[Asterisk Webhook] Created DB call record for allowed call {call_uuid}")
+        existing = await asyncio.to_thread(
+            db.table("calls").select("id").eq("id", call_uuid).limit(1).execute
+        )
+        if not existing.data:
+            await asyncio.to_thread(db.table("calls").insert(insert_payload).execute)
+            logger.info(f"[Asterisk Webhook] Created DB call record for allowed call {call_uuid}")
+        else:
+            logger.info(f"[Asterisk Webhook] Call record {call_uuid} already exists (idempotent retry)")
     except Exception as db_exc:
         logger.error(f"[Asterisk Webhook] Failed to insert call record in DB: {db_exc}")
 
@@ -866,10 +873,8 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
 
 async def _create_rejected_call_record(db, call_uuid, workspace_id, agent_id, phone_id, is_did, provider, caller_id, dialed_number, reason):
     try:
-        import uuid
-        db_call_id = str(uuid.uuid4())
         insert_payload = {
-            "id": db_call_id,
+            "id": call_uuid,
             "call_uuid": call_uuid,
             "twilio_call_sid": call_uuid,
             "workspace_id": workspace_id,

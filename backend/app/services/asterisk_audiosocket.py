@@ -23,6 +23,14 @@ from app.services.stt_service import (
 from app.services.tts_service import WarmTTSConnection
 from app.services.sarvam_tts import WarmSarvamConnection
 from app.services.tts_router import route_tts
+from app.utils.tts_sanitizer import sanitize_text_for_tts
+from app.utils.audio_telephony import (
+    calculate_pcm_rms,
+    apply_pcm_fade_out,
+    apply_pcm_fade_in,
+    assert_audiosocket_format,
+    mask_phone_number
+)
 from app.utils.audio_conversion import ensure_pcm16_mono_8khz, chunk_pcm_for_telephony
 from app.voice_config import voice_cfg
 from app.core.logging_config import get_structured_logger
@@ -71,6 +79,32 @@ class AsteriskVoiceSession:
     Integrates with STT, LLM, and TTS pipelines.
     """
 
+    BACKCHANNELS = {
+        "haan", "hanji", "haanji", "hmm", "hm", "ok", "okay", "theek", "theek hai",
+        "achha", "achha ji", "sahi", "sahi hai", "yes", "yeah", "yep", "right",
+        "हाँ", "हाँजी", "हूँ", "ठीक", "अच्छा"
+    }
+
+    TRAILING_CONNECTORS = {
+        "का", "की", "के", "में", "से", "और", "या", "तो", "लेकिन", "कि", "भी", "पर", "क्योंकि", "मतलब", "अगर",
+        "aur", "ya", "ki", "ka", "ke", "ko", "se", "me", "mein", "par", "lekin", "to", "kyunki", "matlab", "agar",
+        "and", "or", "of", "for", "with", "because", "but", "if"
+    }
+
+    @classmethod
+    def _evaluate_turn_completion(cls, transcript: str):
+        clean_text = re.sub(r'[^\w\s\u0900-\u097F]', '', transcript).strip()
+        words = clean_text.split()
+        if not words:
+            return "empty", 0.0
+        last_w = words[-1].lower()
+        ends_punc = len(transcript) > 0 and transcript[-1] in ('.', '?', '!', '।')
+        if last_w in cls.TRAILING_CONNECTORS:
+            return "incomplete", 0.70
+        elif ends_punc:
+            return "complete", 0.25
+        return "standard", 0.45
+
     def __init__(
         self,
         reader: asyncio.StreamReader,
@@ -96,6 +130,13 @@ class AsteriskVoiceSession:
         self.stt_task = None
         self.greeting_active = False     # True while initial greeting is playing
         self.greeting_protected = False  # True during initial greeting playback to guard against barge-in
+        self.generation_id = 0           # Incremented on turn start/barge-in to invalidate stale audio
+        self.last_audio_energy = 0.0     # Running RMS energy of incoming PCM frames
+        self.turn_state = 'LISTENING'    # State machine: LISTENING -> POSSIBLE_END -> COMMITTED
+        self.accumulated_transcript = ""
+        self.turn_commit_task = None
+        self.first_final_time = 0.0
+        self.llm_service = LLMService(openai_key=settings.openai_api_key)
         # Serialises all writer.write()+drain() calls across pipeline tasks.
         # Prevents interleaved packets if a new pipeline starts while an old
         # drain() is still in flight after barge-in cancellation.
@@ -187,7 +228,8 @@ class AsteriskVoiceSession:
         """
         Cancels any ongoing LLM or TTS tasks (Interruption/Barge-in).
         """
-        logger.info(f'[AsteriskVoiceSession] Cancelling response tasks for call {self.call_uuid}')
+        self.generation_id += 1  # Invalidate all in-flight workers, buffers, and audio
+        logger.info(f'[AsteriskVoiceSession] Cancelling response tasks for call {self.call_uuid} (gen={self.generation_id})')
         if self.llm_tts_task and not self.llm_tts_task.done():
             self.llm_tts_task.cancel()
             try:
@@ -485,9 +527,11 @@ class AsteriskVoiceSession:
         """
         Processes the AI pipeline: LLM stream -> TTS -> PCM resample -> AudioSocket.
         """
+        self.generation_id += 1
+        current_gen = self.generation_id
         pipeline_start = time.time()
         pipeline_type = 'greeting' if is_greeting else 'response'
-        logger.info(f'[Pipeline] STARTED {pipeline_type.upper()} for call {self.call_uuid}')
+        logger.info(f'[Pipeline] STARTED {pipeline_type.upper()} for call {self.call_uuid} (gen={current_gen})')
 
         self.set_state('processing')
         self.barge_in_event.clear()
@@ -564,9 +608,7 @@ class AsteriskVoiceSession:
         # This eliminates the queue race condition where stream_finished_event
         # could fire before playback_worker has registered chunk_queues[0].
         # ----------------------------------------------------------------
-        llm = LLMService(
-            openai_key=settings.openai_api_key,
-        )
+        llm = self.llm_service
         model = self.config.get('model') or voice_cfg.OPENAI_VOICE_MODEL
         logger.info(f'[Pipeline] OpenAI request -> model={model}, max_tokens={voice_cfg.OPENAI_MAX_OUTPUT_TOKENS}')
 
@@ -869,7 +911,11 @@ class AsteriskVoiceSession:
                         while len(playback_buffer) - playback_offset > 48000 and not self.barge_in_event.is_set():
                             await asyncio.sleep(0.1)
 
-                        pcm_8k = await self._synthesize_to_pcm_8k(text, idx)
+                        clean_text = sanitize_text_for_tts(text)
+                        if self.generation_id != current_gen or self.barge_in_event.is_set():
+                            logger.info(f"[Pipeline] Discarding stale TTS chunk #{idx} (gen mismatch)")
+                            continue
+                        pcm_8k = await self._synthesize_to_pcm_8k(clean_text, idx)
 
                         tts_finish_time[idx] = time.time()
                         duration_ms = int((tts_finish_time[idx] - tts_start_time[idx]) * 1000)
@@ -902,20 +948,23 @@ class AsteriskVoiceSession:
                             and not synthesized_audio
                         )
 
-                        if (
-                            buffered_available >= prebuffer_bytes 
-                            or accumulator_done 
-                            or (playback_offset == 0 and len(playback_buffer) > 0)
-                        ):
+                        if buffered_available >= prebuffer_bytes or accumulator_done:
                             logger.info(f"[Pipeline] Playback Start [Buffer: {buffered_available} bytes (~{int(buffered_available/16)}ms)]")
                             break
                         await asyncio.sleep(0.01)
 
-                    next_send_time = time.monotonic()
+                    next_deadline = time.monotonic()
                     consecutive_underflows = 0
+                    total_silence_injected = 0
                     frame_count = 0
+                    was_in_underflow = False
+                    first_frame_logged = False
 
                     while not self.barge_in_event.is_set():
+                        if self.generation_id != current_gen:
+                            logger.info(f"[Pipeline] Playback worker aborted: generation mismatch ({self.generation_id} != {current_gen})")
+                            break
+
                         while next_playback_idx in synthesized_audio:
                             pcm = synthesized_audio[next_playback_idx]
                             if next_playback_idx not in sentence_played_time:
@@ -937,22 +986,36 @@ class AsteriskVoiceSession:
                                 break
 
                             consecutive_underflows += 1
-                            if consecutive_underflows <= 5:
-                                # Comfort silence packet (20ms) keeps AudioSocket clock in lockstep without 400ms pause
+                            total_silence_injected += 1
+                            was_in_underflow = True
+
+                            # Comfort silence (up to 20 frames = 400ms max per turn)
+                            if total_silence_injected <= 20:
                                 chunk = b'\x00' * 320
                             else:
+                                # Hard cap reached: wait for buffer to replenish
                                 await asyncio.sleep(0.01)
-                                next_send_time = time.monotonic()
+                                next_deadline = time.monotonic()
                                 continue
                         else:
                             consecutive_underflows = 0
                             chunk = bytes(playback_buffer[playback_offset:playback_offset+320])
                             playback_offset += 320
 
+                            # Apply fade-in if resuming from silence to eliminate clicks
+                            if was_in_underflow:
+                                chunk = apply_pcm_fade_in(chunk, fade_samples=16)
+                                was_in_underflow = False
+
                         if self._state != 'speaking':
                             self.set_state('speaking')
                             self.speaking_started_at = time.time()
                             logger.info(f'[Pipeline] Speaking started for call {self.call_uuid}')
+
+                        if not first_frame_logged:
+                            first_frame_logged = True
+                            first_audio_ms = int((time.time() - pipeline_start) * 1000)
+                            logger.info(f"[Pipeline] First audio frame played at {first_audio_ms}ms for call {self.call_uuid}")
 
                         if self.writer.is_closing():
                             logger.info(f'[AudioSocket] Writer closed mid-playback')
@@ -970,13 +1033,15 @@ class AsteriskVoiceSession:
                                 logger.error(f'[AudioSocket] Drain error in playback_pacer: {e}')
                                 break
 
-                        next_send_time += 0.02
-                        remaining = next_send_time - time.monotonic()
-                        if remaining > 0.002:
-                            await asyncio.sleep(remaining)
-                        elif remaining < -0.050:
-                            # Compensate for OS scheduling drift
-                            next_send_time = time.monotonic()
+                        # Absolute-deadline pacing with desync recovery
+                        next_deadline += 0.020
+                        now = time.monotonic()
+                        behind = now - next_deadline
+                        if behind > 0.100:
+                            # More than 100ms behind deadline: resync clock
+                            next_deadline = now
+                        elif behind < 0:
+                            await asyncio.sleep(-behind)
 
                 # 5. Pipeline Visualization Task
                 async def pipeline_visualizer():
@@ -1027,6 +1092,19 @@ class AsteriskVoiceSession:
                 elapsed = int((time.time() - pipeline_start) * 1000)
                 logger.info(f'[Pipeline] COMPLETED {pipeline_type.upper()} in {elapsed}ms for call {self.call_uuid}')
 
+                turn_timeline = {
+                    "event": "turn_timeline",
+                    "call_uuid": self.call_uuid,
+                    "turn_id": assistant_seq,
+                    "pipeline_type": pipeline_type,
+                    "generation_id": current_gen,
+                    "llm_first_token_ms": int((llm_first_token_time - pipeline_start) * 1000) if llm_first_token_time else None,
+                    "total_turn_elapsed_ms": elapsed,
+                    "model": model,
+                    "sentences_synthesized": sentences_tts_finished
+                }
+                logger.info(f"[TurnTimeline] {json.dumps(turn_timeline)}")
+
                 # Clean up all spawned worker tasks
                 for t in self.tts_tasks:
                     if not t.done():
@@ -1071,7 +1149,26 @@ class AsteriskVoiceSession:
                 encoding='linear16',
                 sample_rate='8000'
             ):
+                # Backchannels list: acknowledgments that should NOT interrupt bot speech
+                BACKCHANNELS = {
+                    "haan", "hanji", "haanji", "hmm", "hm", "ok", "okay", "theek", "theek hai",
+                    "achha", "achha ji", "sahi", "sahi hai", "yes", "yeah", "yep", "right",
+                    "हाँ", "हाँजी", "हूँ", "ठीक", "अच्छा"
+                }
+
+                # Trailing connectors indicating incomplete thought / clause
+                TRAILING_CONNECTORS = {
+                    "का", "की", "के", "में", "से", "और", "या", "तो", "लेकिन", "कि", "भी", "पर", "क्योंकि", "मतलब", "अगर",
+                    "aur", "ya", "ki", "ka", "ke", "ko", "se", "me", "mein", "par", "lekin", "to", "kyunki", "matlab", "agar",
+                    "and", "or", "of", "for", "with", "because", "but", "if"
+                }
+
                 if event_type == EVT_SPEECH_STARTED:
+                    if self.turn_commit_task and not self.turn_commit_task.done():
+                        self.turn_commit_task.cancel()
+                        self.turn_commit_task = None
+                        logger.info(f"[TurnSM] Speech started, cancelled pending commit timer")
+                    self.turn_state = 'LISTENING'
                     continue
 
                 elif event_type in (EVT_INTERIM, EVT_FINAL, EVT_SPEECH_FINAL):
@@ -1090,43 +1187,102 @@ class AsteriskVoiceSession:
 
                     # 1. BARGE-IN (When bot is actively speaking)
                     if self.is_speaking():
-                        elapsed_speaking = time.time() - self.speaking_started_at
-                        # Echo guard: ignore first 400ms to reject acoustic echo from speaker
-                        if elapsed_speaking < 0.4:
+                        # A. Backchannel check: if caller is merely acknowledging, do not interrupt
+                        is_backchannel = len(words) <= 2 and all(w.lower() in BACKCHANNELS for w in words)
+                        if is_backchannel:
+                            logger.info(f'[Barge-In] Suppressed backchannel acknowledgment during speech: "{transcript}"')
                             continue
 
-                        # Priority interruption words that trigger immediate barge-in
+                        elapsed_speaking = time.time() - self.speaking_started_at
+                        incoming_rms = self.last_audio_energy
+
+                        # B. Echo guard (0 to 400ms): only interrupt on high-energy speech
+                        if elapsed_speaking < 0.4:
+                            if incoming_rms < 16000.0 or len(words) < 2:
+                                logger.debug(f'[Barge-In] Echo guard suppressed audio (elapsed={elapsed_speaking:.2f}s, rms={incoming_rms:.0f})')
+                                continue
+                            else:
+                                logger.info(f'[Barge-In] Early high-energy speech override inside echo guard (rms={incoming_rms:.0f})')
+
+                        # C. Interruption validation
                         PRIORITY_INTERRUPT = {
                             "stop", "ruko", "suno", "wait", "nahi", "no", "hello", "arre", "ek", "minute"
                         }
                         is_priority = any(w.lower() in PRIORITY_INTERRUPT for w in words)
 
-                        # Require at least 2 distinct words or priority keyword (rejects background clicks/noise)
-                        if is_priority or len(words) >= 2:
-                            logger.info(f'[Barge-In] Valid interruption ({len(words)} words, elapsed={elapsed_speaking:.1f}s): "{transcript}"')
+                        if is_priority or len(words) >= 2 or incoming_rms > 14000.0:
+                            logger.info(
+                                f'[Barge-In] Valid interruption ({len(words)} words, rms={incoming_rms:.0f}, '
+                                f'elapsed={elapsed_speaking:.1f}s): "{transcript}"'
+                            )
                             self.barge_in_event.set()
                             await self.cancel_llm_tts()
+                            if event_type in (EVT_SPEECH_FINAL, EVT_FINAL):
+                                logger.info(f'[Barge-In] Final speech turn during interruption: "{transcript}"')
+                                self.accumulated_transcript = clean_text
+                                self.llm_tts_task = asyncio.create_task(
+                                    self.run_llm_tts_pipeline(clean_text)
+                                )
                         continue
 
-                    # 2. TURN DETECTION (When bot is listening / idle)
-                    if event_type in (EVT_SPEECH_FINAL, EVT_FINAL):
-                        # Detect trailing conjunctions/connectors to avoid cutting off mid-clause
-                        TRAILING_CONNECTORS = {
-                            "का", "की", "के", "में", "से", "और", "या", "तो", "लेकिन", "कि", "भी",
-                            "and", "or", "to", "of", "for", "with", "because"
-                        }
-                        last_w = words[-1].lower() if words else ""
-                        if last_w in TRAILING_CONNECTORS:
-                            logger.info(f"[STT] Incomplete clause ending in '{last_w}', waiting for continuation: '{transcript}'")
-                            await asyncio.sleep(0.35)
-                            continue
+                    # 2. TURN DETECTION STATE MACHINE (When bot is listening / idle)
+                    if event_type == EVT_INTERIM:
+                        # Cancel any pending turn commit because caller is still actively uttering words
+                        if self.turn_commit_task and not self.turn_commit_task.done():
+                            self.turn_commit_task.cancel()
+                            self.turn_commit_task = None
+                            logger.info(f"[TurnSM] User speech resumed during pause, commit cancelled. Interim: '{transcript}'")
+                        self.turn_state = 'LISTENING'
 
-                        logger.info(f'[STT] User speech turn finalized: "{transcript}"')
-                        logger.transcript_final(transcript, 1.0, 0)
-                        await self.cancel_llm_tts()
-                        self.llm_tts_task = asyncio.create_task(
-                            self.run_llm_tts_pipeline(transcript)
-                        )
+                    elif event_type in (EVT_SPEECH_FINAL, EVT_FINAL):
+                        self.turn_state = 'POSSIBLE_END'
+                        if self.accumulated_transcript:
+                            self.accumulated_transcript += " " + clean_text
+                        else:
+                            self.accumulated_transcript = clean_text
+                            self.first_final_time = time.time()
+
+                        acc_words = self.accumulated_transcript.split()
+                        last_w = acc_words[-1].lower() if acc_words else ""
+                        ends_punc = len(transcript) > 0 and transcript[-1] in ('.', '?', '!', '।')
+
+                        # Adaptive wait time calculation
+                        if last_w in TRAILING_CONNECTORS:
+                            adaptive_wait = 0.70  # 700ms wait for trailing clause continuation
+                            logger.info(f"[TurnSM] Trailing connector '{last_w}' detected, pausing 700ms: '{self.accumulated_transcript}'")
+                        elif ends_punc:
+                            adaptive_wait = 0.25  # 250ms fast commit on complete sentence
+                        else:
+                            adaptive_wait = 0.45  # 450ms standard conversational pause
+
+                        # Hard cap: max 1.2s wait after first final
+                        if time.time() - self.first_final_time >= 1.2:
+                            adaptive_wait = 0.0
+
+                        if self.turn_commit_task and not self.turn_commit_task.done():
+                            self.turn_commit_task.cancel()
+
+                        candidate_text = self.accumulated_transcript
+
+                        async def _do_commit_turn(wait_s: float, text_to_commit: str):
+                            try:
+                                if wait_s > 0:
+                                    await asyncio.sleep(wait_s)
+                                self.turn_state = 'COMMITTED'
+                                self.accumulated_transcript = ""
+                                self.first_final_time = 0.0
+                                logger.info(f"[TurnSM] Turn COMMITTED (after {int(wait_s*1000)}ms wait): '{text_to_commit}'")
+                                await self.cancel_llm_tts()
+                                self.llm_tts_task = asyncio.create_task(
+                                    self.run_llm_tts_pipeline(text_to_commit)
+                                )
+                            except asyncio.CancelledError:
+                                pass
+
+                        if adaptive_wait == 0.0:
+                            self.turn_commit_task = asyncio.create_task(_do_commit_turn(0.0, candidate_text))
+                        else:
+                            self.turn_commit_task = asyncio.create_task(_do_commit_turn(adaptive_wait, candidate_text))
 
                 elif event_type == EVT_UTTERANCE_END:
                     continue
@@ -1173,6 +1329,7 @@ class AsteriskVoiceSession:
                     continue
                 elif msg_type in (16, 1):
                     if len(payload) > 0:
+                        self.last_audio_energy = calculate_pcm_rms(payload)
                         if self.stt_task is None or self.stt_task.done():
                             logger.warning('[AudioSocket] STT task was done/dead - restarting')
                             self.stt_task = asyncio.create_task(self.stt_loop())
@@ -1276,9 +1433,11 @@ class AsteriskAudioSocketServer:
             callee = context.get("dialed_number") or ""
             agent_id = context.get("agent_id") or ""
             
-            logger.set_context(session_uuid=call_uuid, caller=caller)
+            masked_caller = mask_phone_number(caller)
+            masked_callee = mask_phone_number(callee)
+            logger.set_context(session_uuid=call_uuid, caller=masked_caller)
             logger.call_direction_detected(direction)
-            logger.caller_info(caller, callee, agent_id)
+            logger.caller_info(masked_caller, masked_callee, agent_id)
             
             diagnostics.record_session_start(
                 session_uuid=call_uuid,
@@ -1362,10 +1521,25 @@ class AsteriskAudioSocketServer:
 
 _audiosocket_server: Optional[AsteriskAudioSocketServer] = None
 
+async def _monitor_event_loop_lag():
+    while True:
+        try:
+            t0 = time.monotonic()
+            await asyncio.sleep(0.100)
+            actual = time.monotonic() - t0
+            lag_ms = (actual - 0.100) * 1000
+            if lag_ms > 20.0:
+                logger.warning(f"[EventLoopLag] High asyncio loop lag detected: {lag_ms:.1f}ms")
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
 async def start_audiosocket_server(host: str, port: int) -> None:
     global _audiosocket_server
     _audiosocket_server = AsteriskAudioSocketServer(host, port)
     await _audiosocket_server.start()
+    asyncio.create_task(_monitor_event_loop_lag())
 
 async def stop_audiosocket_server() -> None:
     global _audiosocket_server

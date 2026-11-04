@@ -902,11 +902,7 @@ class AsteriskVoiceSession:
                             and not synthesized_audio
                         )
 
-                        if (
-                            buffered_available >= prebuffer_bytes 
-                            or accumulator_done 
-                            or (playback_offset == 0 and len(playback_buffer) > 0)
-                        ):
+                        if buffered_available >= prebuffer_bytes or accumulator_done:
                             logger.info(f"[Pipeline] Playback Start [Buffer: {buffered_available} bytes (~{int(buffered_available/16)}ms)]")
                             break
                         await asyncio.sleep(0.01)
@@ -1106,14 +1102,20 @@ class AsteriskVoiceSession:
                             logger.info(f'[Barge-In] Valid interruption ({len(words)} words, elapsed={elapsed_speaking:.1f}s): "{transcript}"')
                             self.barge_in_event.set()
                             await self.cancel_llm_tts()
+                            if event_type in (EVT_SPEECH_FINAL, EVT_FINAL):
+                                logger.info(f'[Barge-In] Final speech turn during interruption: "{transcript}"')
+                                self.llm_tts_task = asyncio.create_task(
+                                    self.run_llm_tts_pipeline(transcript)
+                                )
                         continue
 
                     # 2. TURN DETECTION (When bot is listening / idle)
                     if event_type in (EVT_SPEECH_FINAL, EVT_FINAL):
                         # Detect trailing conjunctions/connectors to avoid cutting off mid-clause
                         TRAILING_CONNECTORS = {
-                            "का", "की", "के", "में", "से", "और", "या", "तो", "लेकिन", "कि", "भी",
-                            "and", "or", "to", "of", "for", "with", "because"
+                            "का", "की", "के", "में", "से", "और", "या", "तो", "लेकिन", "कि", "भी", "पर",
+                            "aur", "ya", "ki", "ka", "ke", "ko", "se", "me", "mein", "par", "lekin", "to",
+                            "and", "or", "of", "for", "with", "because", "but"
                         }
                         last_w = words[-1].lower() if words else ""
                         if last_w in TRAILING_CONNECTORS:

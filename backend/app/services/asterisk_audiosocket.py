@@ -1,3 +1,9 @@
+import hashlib
+from collections import OrderedDict
+
+# Global in-memory LRU cache for synthesized greetings: (agent_id, voice_id, language, text_hash) -> pcm_8k
+_GREETING_CACHE: OrderedDict[tuple, bytes] = OrderedDict()
+_GREETING_CACHE_MAX_SIZE = 100
 import asyncio
 import json
 import logging
@@ -335,18 +341,20 @@ class AsteriskVoiceSession:
                 else:
                     base += "\n\nOVERRIDE: You are a female Indian voice assistant. Use female Hinglish grammar rules: 'sakti hoon', 'gayi', 'leti hoon', 'deti hoon'. Do NOT use male phrases."
 
-        # Strict prompt instructions based on the selected language
+        # Strict phone/voice rules: maximum 20 words per reply, first sentence under 12 words
         if is_hindi:
             voice_prefix = (
                 "You are a real-time voice assistant on a phone call. You MUST answer in short, natural Hindi (Devanagari script). "
                 "Do NOT use Roman Hinglish. Speak and reply using clean, conversational Hindi. "
-                "Maximum response length: 1–2 sentences. Avoid long explanations. "
+                "Maximum 20 words per reply. First sentence under 12 words. One idea per reply. "
+                "Never read lists or full price tables unless the caller asks; summarize and offer details. "
                 "Keep replies brief, direct, and conversational."
             )
         else:
             voice_prefix = (
                 "You are a real-time voice assistant on a phone call. You MUST answer in short Hinglish. "
-                "Maximum response length: 1–2 sentences. Avoid long explanations. "
+                "Maximum 20 words per reply. First sentence under 12 words. One idea per reply. "
+                "Never read lists or full price tables unless the caller asks; summarize and offer details. "
                 "Use natural spoken language. Never generate paragraphs for voice calls. "
                 "Keep replies brief, direct, and conversational."
             )
@@ -358,14 +366,98 @@ class AsteriskVoiceSession:
 
     async def trigger_initial_greeting(self) -> None:
         """
-        Triggers the initial welcome greeting asynchronously.
+        Plays pre-synthesized greeting PCM immediately from cache if available,
+        starting speech in <50ms without waiting for LLM or TTS.
+        Falls back to pipeline on cache miss and populates cache.
         """
         logger.info(f'[AsteriskVoiceSession] Triggering initial greeting for call {self.call_uuid}')
+        agent_id = self.config.get('agent_id') or self.context.get('agent_id') or 'default'
+        voice_id = self.config.get('voice_id') or 'default'
+        language = (self.config.get('language') or 'hi-IN').lower()
+
+        # Fixed greeting text if configured on agent, otherwise default standard greeting
+        greeting_text = (self.config.get('first_message') or self.config.get('greeting') or '').strip()
+        if not greeting_text:
+            if language.startswith('hi'):
+                greeting_text = "Namaste! MetaBull Universe mein aapka swagat hai. Main aapki kya madad kar sakti hoon?"
+            else:
+                greeting_text = "Hello! Welcome to MetaBull Universe. How can I assist you today?"
+
+        text_hash = hashlib.sha256(greeting_text.encode('utf-8')).hexdigest()[:16]
+        cache_key = (agent_id, voice_id, language, text_hash)
+
+        if cache_key in _GREETING_CACHE:
+            pcm_8k = _GREETING_CACHE[cache_key]
+            _GREETING_CACHE.move_to_end(cache_key)
+            logger.info(f"[Greeting] Cache HIT for key {cache_key} ({len(pcm_8k)} bytes) - starting instant playback")
+            self.llm_tts_task = asyncio.create_task(self._play_cached_greeting(pcm_8k, greeting_text))
+        else:
+            logger.info(f"[Greeting] Cache MISS for key {cache_key} - synthesizing and caching")
+            async def _synth_and_cache():
+                try:
+                    pcm_8k = await self._synthesize_to_pcm_8k(greeting_text, 0)
+                    if pcm_8k:
+                        _GREETING_CACHE[cache_key] = pcm_8k
+                        if len(_GREETING_CACHE) > _GREETING_CACHE_MAX_SIZE:
+                            _GREETING_CACHE.popitem(last=False)
+                        logger.info(f"[Greeting] Cached {len(pcm_8k)} bytes for {cache_key}")
+                        await self._play_cached_greeting(pcm_8k, greeting_text)
+                    else:
+                        await self.run_llm_tts_pipeline('', is_greeting=True)
+                except Exception as e:
+                    logger.error(f"[Greeting] Synthesis fallback error: {e}")
+                    await self.run_llm_tts_pipeline('', is_greeting=True)
+
+            self.llm_tts_task = asyncio.create_task(_synth_and_cache())
+
+    async def _play_cached_greeting(self, pcm_8k: bytes, greeting_text: str) -> None:
+        """Plays raw 8kHz PCM directly through the AudioSocket writer with absolute deadline pacing."""
+        self.generation_id += 1
+        current_gen = self.generation_id
+        self.set_state('speaking')
+        self.speaking_started_at = time.time()
         self.greeting_active = True
         self.greeting_protected = True
-        self.llm_tts_task = asyncio.create_task(
-            self.run_llm_tts_pipeline('', is_greeting=True)
-        )
+
+        offset = 0
+        total_bytes = len(pcm_8k)
+        next_send_time = time.monotonic()
+        logger.info(f"[Greeting] Playing cached greeting ({total_bytes} bytes, ~{int(total_bytes/16)}ms) for call {self.call_uuid}")
+
+        try:
+            while offset < total_bytes and not self.barge_in_event.is_set():
+                if self.generation_id != current_gen:
+                    break
+                chunk = pcm_8k[offset:offset+320]
+                offset += 320
+
+                if self.writer.is_closing():
+                    break
+
+                packet = bytes([0x10]) + len(chunk).to_bytes(2, "big") + chunk
+                async with self._writer_lock:
+                    self.writer.write(packet)
+                    try:
+                        await self.writer.drain()
+                    except Exception as e:
+                        logger.error(f"[Greeting] Drain error: {e}")
+                        break
+
+                next_send_time += 0.020
+                now = time.monotonic()
+                behind = now - next_send_time
+                if behind > 0.100:
+                    next_send_time = now
+                elif behind < 0:
+                    await asyncio.sleep(-behind)
+
+            self.messages.append({'role': 'assistant', 'content': greeting_text})
+        finally:
+            self.greeting_active = False
+            self.greeting_protected = False
+            self.greeting_played = True
+            self.set_state('idle')
+            logger.info(f"[Greeting] Initial greeting finished for call {self.call_uuid}")
 
     async def send_audio(self, audio_data: bytes, pcm_already_8khz: bool = False) -> None:
         """
@@ -433,10 +525,11 @@ class AsteriskVoiceSession:
                     break
             
             chunk_num += 1
-            logger.info(
-                f'[AudioSocket] sending chunk {chunk_num} payload={len(chunk)} '
-                f'packet={len(packet)}'
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f'[AudioSocket] sending chunk {chunk_num} payload={len(chunk)} '
+                    f'packet={len(packet)}'
+                )
             offset += len(chunk)
             await asyncio.sleep(0.02)
 
@@ -697,18 +790,39 @@ class AsteriskVoiceSession:
                 self.greeting_protected = False
             return
 
-        def _insert_assist_msg(seq: int, response_text: str, model_name: str):
-            """DB write - runs in a thread, all args passed explicitly."""
+        pipeline_started_at_iso = datetime.now(timezone.utc).isoformat()
+
+        def _insert_assist_msg(
+            seq: int,
+            response_text: str,
+            model_name: str,
+            started_at_iso: str,
+            llm_first_token_ms: Optional[int] = None,
+            tts_first_byte_ms: Optional[int] = None,
+            first_audio_ms: Optional[int] = None,
+            total_playback_ms: Optional[int] = None
+        ):
+            """DB write - runs in a thread, records start time at pipeline trigger and turn latency metrics."""
             try:
                 db = get_supabase_client()
-                db.table('call_messages').insert({
+                payload = {
                     'call_id': self.call_uuid,
                     'role': 'assistant',
                     'content': response_text,
                     'sequence_number': seq,
-                    'started_at': datetime.now(timezone.utc).isoformat(),
+                    'started_at': started_at_iso,
                     'model_used': model_name
-                }).execute()
+                }
+                if llm_first_token_ms is not None:
+                    payload['llm_first_token_ms'] = llm_first_token_ms
+                if tts_first_byte_ms is not None:
+                    payload['tts_first_byte_ms'] = tts_first_byte_ms
+                if first_audio_ms is not None:
+                    payload['first_audio_ms'] = first_audio_ms
+                if total_playback_ms is not None:
+                    payload['total_playback_ms'] = total_playback_ms
+
+                db.table('call_messages').insert(payload).execute()
             except Exception as db_err:
                 logger.error(f'[Pipeline] Failed to persist assistant message: {db_err}')
 
@@ -836,9 +950,30 @@ class AsteriskVoiceSession:
                 self.messages.append({'role': 'assistant', 'content': full_response})
                 elapsed = int((time.time() - pipeline_start) * 1000)
                 logger.info(f'[Pipeline] COMPLETED {pipeline_type.upper()} in {elapsed}ms for call {self.call_uuid}')
+
+                commit_delay_ms = int((pipeline_start - self.t_speech_final) * 1000) if self.t_speech_final > 0 else 0
+                llm_tok_ms = int((llm_first_token_time - pipeline_start) * 1000) if llm_first_token_time else None
+                first_sent_ms = int((first_sentence_ready_time - pipeline_start) * 1000) if first_sentence_ready_time else None
+                tts_byte_ms = int((getattr(self, 'tts_first_byte_time', 0.0) - pipeline_start) * 1000) if getattr(self, 'tts_first_byte_time', 0.0) > 0 else None
+                first_aud_ms = int((getattr(self, 'first_audio_frame_time', 0.0) - pipeline_start) * 1000) if getattr(self, 'first_audio_frame_time', 0.0) > 0 else None
+                playback_dur_ms = int((time.time() - getattr(self, 'first_audio_frame_time', pipeline_start)) * 1000)
+
+                latency_turn = {
+                    "event": "latency_turn",
+                    "call_uuid": self.call_uuid,
+                    "turn_id": assistant_seq,
+                    "commit_delay_ms": commit_delay_ms,
+                    "llm_first_token_ms": llm_tok_ms,
+                    "first_sentence_ms": first_sent_ms,
+                    "tts_first_byte_ms": tts_byte_ms,
+                    "first_audio_ms": first_aud_ms,
+                    "playback_ms": playback_dur_ms,
+                    "total_turn_ms": elapsed
+                }
+                logger.info(f"[LatencyTurn] {json.dumps(latency_turn)}")
                 try:
                     asyncio.create_task(
-                        asyncio.to_thread(_insert_assist_msg, assistant_seq, full_response, model)
+                        asyncio.to_thread(_insert_assist_msg, assistant_seq, full_response, model, pipeline_started_at_iso, llm_tok_ms if "llm_tok_ms" in locals() else None, tts_byte_ms if "tts_byte_ms" in locals() else None, first_aud_ms if "first_aud_ms" in locals() else None, playback_dur_ms if "playback_dur_ms" in locals() else None)
                     )
                 except Exception as e:
                     logger.error(f'Failed to schedule assistant message DB write: {e}')
@@ -1190,6 +1325,27 @@ class AsteriskVoiceSession:
                 elapsed = int((time.time() - pipeline_start) * 1000)
                 logger.info(f'[Pipeline] COMPLETED {pipeline_type.upper()} in {elapsed}ms for call {self.call_uuid}')
 
+                commit_delay_ms = int((pipeline_start - self.t_speech_final) * 1000) if self.t_speech_final > 0 else 0
+                llm_tok_ms = int((llm_first_token_time - pipeline_start) * 1000) if llm_first_token_time else None
+                first_sent_ms = int((first_sentence_ready_time - pipeline_start) * 1000) if first_sentence_ready_time else None
+                tts_byte_ms = int((getattr(self, 'tts_first_byte_time', 0.0) - pipeline_start) * 1000) if getattr(self, 'tts_first_byte_time', 0.0) > 0 else None
+                first_aud_ms = int((getattr(self, 'first_audio_frame_time', 0.0) - pipeline_start) * 1000) if getattr(self, 'first_audio_frame_time', 0.0) > 0 else None
+                playback_dur_ms = int((time.time() - getattr(self, 'first_audio_frame_time', pipeline_start)) * 1000)
+
+                latency_turn = {
+                    "event": "latency_turn",
+                    "call_uuid": self.call_uuid,
+                    "turn_id": assistant_seq,
+                    "commit_delay_ms": commit_delay_ms,
+                    "llm_first_token_ms": llm_tok_ms,
+                    "first_sentence_ms": first_sent_ms,
+                    "tts_first_byte_ms": tts_byte_ms,
+                    "first_audio_ms": first_aud_ms,
+                    "playback_ms": playback_dur_ms,
+                    "total_turn_ms": elapsed
+                }
+                logger.info(f"[LatencyTurn] {json.dumps(latency_turn)}")
+
                 turn_timeline = {
                     "event": "turn_timeline",
                     "call_uuid": self.call_uuid,
@@ -1211,7 +1367,7 @@ class AsteriskVoiceSession:
 
                 try:
                     asyncio.create_task(
-                        asyncio.to_thread(_insert_assist_msg, assistant_seq, full_response, model)
+                        asyncio.to_thread(_insert_assist_msg, assistant_seq, full_response, model, pipeline_started_at_iso, llm_tok_ms if "llm_tok_ms" in locals() else None, tts_byte_ms if "tts_byte_ms" in locals() else None, first_aud_ms if "first_aud_ms" in locals() else None, playback_dur_ms if "playback_dur_ms" in locals() else None)
                     )
                 except Exception as e:
                     logger.error(f'Failed to schedule assistant message DB write: {e}')
@@ -1406,11 +1562,14 @@ class AsteriskVoiceSession:
                             self.stt_task = asyncio.create_task(self.stt_loop())
                         try:
                             self.audio_queue.put_nowait(payload)
-                            diagnostics.update_session_state(
-                                self.call_uuid,
-                                state=self._state,
-                                audio_received=len(payload)
-                            )
+                            # Update diagnostics once per second (every 50 packets) to reduce event-loop overhead
+                            self._packet_count = getattr(self, '_packet_count', 0) + 1
+                            if self._packet_count % 50 == 0:
+                                diagnostics.update_session_state(
+                                    self.call_uuid,
+                                    state=self._state,
+                                    audio_received=len(payload) * 50
+                                )
                         except asyncio.QueueFull:
                             pass
                 else:
@@ -1600,7 +1759,11 @@ async def _monitor_event_loop_lag():
             actual = time.monotonic() - t0
             lag_ms = (actual - 0.100) * 1000
             if lag_ms > 20.0:
-                logger.warning(f"[EventLoopLag] High asyncio loop lag detected: {lag_ms:.1f}ms")
+                active_count = len(_audiosocket_server.active_connections) if _audiosocket_server else 0
+                if lag_ms > 50.0:
+                    logger.warning(f"[EventLoopLag] High asyncio loop lag: {lag_ms:.1f}ms (Active calls: {active_count})")
+                else:
+                    logger.info(f"[EventLoopLag] Loop lag: {lag_ms:.1f}ms (Active calls: {active_count})")
         except asyncio.CancelledError:
             break
         except Exception:

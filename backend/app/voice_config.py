@@ -18,7 +18,7 @@ class VoiceConfig(BaseSettings):
     TURN_COMMIT_SAFETY_NET_MS: int = 1000      # Safety net commit when speech_final does not fire
 
     # LLM tuning
-    OPENAI_MAX_OUTPUT_TOKENS: int = 80
+    OPENAI_MAX_OUTPUT_TOKENS: int = 120
     OPENAI_VOICE_MODEL: str = "gpt-4o-mini"
     VOICE_SYSTEM_PREFIX: str = (
         "Reply briefly and naturally for a phone/voice conversation. "

@@ -285,6 +285,9 @@ class AsteriskVoiceSession:
         if self.tts_conn:
             await self.tts_conn.cancel()
 
+        if self.sarvam_tts_conn:
+            self.sarvam_tts_conn.ensure_connected_soon()
+
         # Lock barrier: if the cancelled task was mid write+drain when it got
         # the CancelledError, that write+drain holds _writer_lock. Acquiring
         # and immediately releasing here blocks until that lock is fully

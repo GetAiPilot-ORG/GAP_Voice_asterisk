@@ -100,10 +100,45 @@ class AsteriskVoiceSession:
         last_w = words[-1].lower()
         ends_punc = len(transcript) > 0 and transcript[-1] in ('.', '?', '!', '।')
         if last_w in cls.TRAILING_CONNECTORS:
-            return "incomplete", 0.70
+            return "incomplete", voice_cfg.TURN_COMMIT_CONNECTOR_WAIT_MS / 1000.0
         elif ends_punc:
-            return "complete", 0.25
-        return "standard", 0.45
+            return "complete", 0.0
+        return "standard", 0.0
+
+    def _schedule_commit(self, wait_s: float) -> None:
+        """
+        Schedules a turn commit after wait_s seconds.
+        Cancels any existing commit task. At commit time, reads accumulated_transcript,
+        clears accumulator, sets turn_state='COMMITTED', records commit timestamp,
+        cancels LLM/TTS if running, and launches run_llm_tts_pipeline.
+        """
+        if self.turn_commit_task and not self.turn_commit_task.done():
+            self.turn_commit_task.cancel()
+            self.turn_commit_task = None
+
+        async def _commit_job():
+            try:
+                if wait_s > 0:
+                    await asyncio.sleep(wait_s)
+                text = self.accumulated_transcript.strip()
+                if not text:
+                    logger.debug("[TurnSM] Scheduled commit fired but accumulated transcript is empty")
+                    return
+                self.turn_state = 'COMMITTED'
+                self.accumulated_transcript = ""
+                self.first_final_time = 0.0
+                self.turn_commit_timestamp = time.time()
+                logger.info(f"[TurnSM] Turn COMMITTED (after {int(wait_s*1000)}ms wait): '{text}'")
+                await self.cancel_llm_tts()
+                self.llm_tts_task = asyncio.create_task(
+                    self.run_llm_tts_pipeline(text)
+                )
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"[TurnSM] Error in _commit_job: {e}", exc_info=True)
+
+        self.turn_commit_task = asyncio.create_task(_commit_job())
 
     def __init__(
         self,
@@ -136,6 +171,8 @@ class AsteriskVoiceSession:
         self.accumulated_transcript = ""
         self.turn_commit_task = None
         self.first_final_time = 0.0
+        self.turn_commit_timestamp = 0.0
+        self.t_speech_final = 0.0
         self.llm_service = LLMService(openai_key=settings.openai_api_key)
         # Serialises all writer.write()+drain() calls across pipeline tasks.
         # Prevents interleaved packets if a new pipeline starts while an old
@@ -1147,22 +1184,9 @@ class AsteriskVoiceSession:
                 endpointing=voice_cfg.STT_ENDPOINTING_MS,
                 model=voice_cfg.STT_MODEL,
                 encoding='linear16',
-                sample_rate='8000'
+                sample_rate='8000',
+                utterance_end_ms=voice_cfg.STT_UTTERANCE_END_MS,
             ):
-                # Backchannels list: acknowledgments that should NOT interrupt bot speech
-                BACKCHANNELS = {
-                    "haan", "hanji", "haanji", "hmm", "hm", "ok", "okay", "theek", "theek hai",
-                    "achha", "achha ji", "sahi", "sahi hai", "yes", "yeah", "yep", "right",
-                    "हाँ", "हाँजी", "हूँ", "ठीक", "अच्छा"
-                }
-
-                # Trailing connectors indicating incomplete thought / clause
-                TRAILING_CONNECTORS = {
-                    "का", "की", "के", "में", "से", "और", "या", "तो", "लेकिन", "कि", "भी", "पर", "क्योंकि", "मतलब", "अगर",
-                    "aur", "ya", "ki", "ka", "ke", "ko", "se", "me", "mein", "par", "lekin", "to", "kyunki", "matlab", "agar",
-                    "and", "or", "of", "for", "with", "because", "but", "if"
-                }
-
                 if event_type == EVT_SPEECH_STARTED:
                     if self.turn_commit_task and not self.turn_commit_task.done():
                         self.turn_commit_task.cancel()
@@ -1176,19 +1200,16 @@ class AsteriskVoiceSession:
                         continue
 
                     transcript = payload.get('transcript', '').strip()
-                    if not transcript:
-                        continue
-
-                    clean_text = re.sub(r'[^\w\s\u0900-\u097F]', '', transcript).strip()
-                    if not clean_text:
-                        continue
-
-                    words = clean_text.split()
+                    clean_text = re.sub(r'[^\w\s\u0900-\u097F]', '', transcript).strip() if transcript else ""
 
                     # 1. BARGE-IN (When bot is actively speaking)
                     if self.is_speaking():
+                        if not clean_text:
+                            continue
+                        words = clean_text.split()
+
                         # A. Backchannel check: if caller is merely acknowledging, do not interrupt
-                        is_backchannel = len(words) <= 2 and all(w.lower() in BACKCHANNELS for w in words)
+                        is_backchannel = len(words) <= 2 and all(w.lower() in self.BACKCHANNELS for w in words)
                         if is_backchannel:
                             logger.info(f'[Barge-In] Suppressed backchannel acknowledgment during speech: "{transcript}"')
                             continue
@@ -1227,7 +1248,7 @@ class AsteriskVoiceSession:
 
                     # 2. TURN DETECTION STATE MACHINE (When bot is listening / idle)
                     if event_type == EVT_INTERIM:
-                        # Cancel any pending turn commit because caller is still actively uttering words
+                        # Cancel pending commit because caller is still actively uttering words
                         if self.turn_commit_task and not self.turn_commit_task.done():
                             self.turn_commit_task.cancel()
                             self.turn_commit_task = None
@@ -1235,6 +1256,16 @@ class AsteriskVoiceSession:
                         self.turn_state = 'LISTENING'
 
                     elif event_type in (EVT_SPEECH_FINAL, EVT_FINAL):
+                        if event_type == EVT_SPEECH_FINAL:
+                            self.t_speech_final = time.time()
+
+                        # If transcript is empty:
+                        if not clean_text:
+                            if event_type == EVT_SPEECH_FINAL and self.accumulated_transcript.strip():
+                                logger.info("[TurnSM] Empty transcript on SPEECH_FINAL with non-empty accumulator -> immediate commit")
+                                self._schedule_commit(0.0)
+                            continue
+
                         self.turn_state = 'POSSIBLE_END'
                         if self.accumulated_transcript:
                             self.accumulated_transcript += " " + clean_text
@@ -1242,50 +1273,29 @@ class AsteriskVoiceSession:
                             self.accumulated_transcript = clean_text
                             self.first_final_time = time.time()
 
-                        acc_words = self.accumulated_transcript.split()
-                        last_w = acc_words[-1].lower() if acc_words else ""
-                        ends_punc = len(transcript) > 0 and transcript[-1] in ('.', '?', '!', '।')
-
-                        # Adaptive wait time calculation
-                        if last_w in TRAILING_CONNECTORS:
-                            adaptive_wait = 0.70  # 700ms wait for trailing clause continuation
-                            logger.info(f"[TurnSM] Trailing connector '{last_w}' detected, pausing 700ms: '{self.accumulated_transcript}'")
-                        elif ends_punc:
-                            adaptive_wait = 0.25  # 250ms fast commit on complete sentence
-                        else:
-                            adaptive_wait = 0.45  # 450ms standard conversational pause
-
                         # Hard cap: max 1.2s wait after first final
                         if time.time() - self.first_final_time >= 1.2:
-                            adaptive_wait = 0.0
+                            logger.info("[TurnSM] Hard cap (1.2s) reached since first final -> immediate commit")
+                            self._schedule_commit(0.0)
+                        elif event_type == EVT_SPEECH_FINAL:
+                            acc_words = self.accumulated_transcript.split()
+                            last_w = acc_words[-1].lower() if acc_words else ""
+                            if last_w in self.TRAILING_CONNECTORS:
+                                wait_s = voice_cfg.TURN_COMMIT_CONNECTOR_WAIT_MS / 1000.0
+                                logger.info(f"[TurnSM] Trailing connector '{last_w}' on SPEECH_FINAL, pausing {int(wait_s*1000)}ms")
+                                self._schedule_commit(wait_s)
+                            else:
+                                logger.info("[TurnSM] SPEECH_FINAL on complete utterance -> immediate commit")
+                                self._schedule_commit(0.0)
+                        elif event_type == EVT_FINAL:
+                            safety_wait = voice_cfg.TURN_COMMIT_SAFETY_NET_MS / 1000.0
+                            logger.info(f"[TurnSM] EVT_FINAL received, scheduling safety net commit in {int(safety_wait*1000)}ms")
+                            self._schedule_commit(safety_wait)
 
-                        if self.turn_commit_task and not self.turn_commit_task.done():
-                            self.turn_commit_task.cancel()
-
-                        candidate_text = self.accumulated_transcript
-
-                        async def _do_commit_turn(wait_s: float, text_to_commit: str):
-                            try:
-                                if wait_s > 0:
-                                    await asyncio.sleep(wait_s)
-                                self.turn_state = 'COMMITTED'
-                                self.accumulated_transcript = ""
-                                self.first_final_time = 0.0
-                                logger.info(f"[TurnSM] Turn COMMITTED (after {int(wait_s*1000)}ms wait): '{text_to_commit}'")
-                                await self.cancel_llm_tts()
-                                self.llm_tts_task = asyncio.create_task(
-                                    self.run_llm_tts_pipeline(text_to_commit)
-                                )
-                            except asyncio.CancelledError:
-                                pass
-
-                        if adaptive_wait == 0.0:
-                            self.turn_commit_task = asyncio.create_task(_do_commit_turn(0.0, candidate_text))
-                        else:
-                            self.turn_commit_task = asyncio.create_task(_do_commit_turn(adaptive_wait, candidate_text))
-
-                elif event_type == EVT_UTTERANCE_END:
-                    continue
+                    elif event_type == EVT_UTTERANCE_END:
+                        if self.accumulated_transcript.strip():
+                            logger.info("[TurnSM] EVT_UTTERANCE_END with non-empty accumulator -> immediate commit")
+                            self._schedule_commit(0.0)
 
                 elif event_type == EVT_ERROR:
                     logger.error(f'[STT error] {payload}')

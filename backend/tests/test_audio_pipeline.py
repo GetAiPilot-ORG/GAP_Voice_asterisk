@@ -107,23 +107,26 @@ async def test_monotonic_playback_pacer():
 
 
 def test_turn_detection_connectors():
-    """Trailing connectors delay commit, while sentence end punctuation permits fast commit."""
+    """Trailing connectors delay commit, while sentence end punctuation permits immediate commit."""
     from app.services.asterisk_audiosocket import AsteriskVoiceSession
+    from app.voice_config import voice_cfg
+
+    expected_connector_wait = voice_cfg.TURN_COMMIT_CONNECTOR_WAIT_MS / 1000.0
 
     # Incomplete turn ending with Hinglish connector 'aur'
     status_incomplete, delay1 = AsteriskVoiceSession._evaluate_turn_completion("mujhe website aur")
     assert status_incomplete == "incomplete"
-    assert delay1 == 0.70
+    assert delay1 == expected_connector_wait
 
     # Incomplete turn ending with Hindi connector 'और'
     status_incomplete_hi, delay2 = AsteriskVoiceSession._evaluate_turn_completion("मुझे वेबसाइट और")
     assert status_incomplete_hi == "incomplete"
-    assert delay2 == 0.70
+    assert delay2 == expected_connector_wait
 
     # Complete sentence ending with question mark
     status_complete, delay3 = AsteriskVoiceSession._evaluate_turn_completion("pricing kya hai?")
     assert status_complete == "complete"
-    assert delay3 == 0.25
+    assert delay3 == 0.0
 
 
 def test_barge_in_echo_guard_and_backchannels():

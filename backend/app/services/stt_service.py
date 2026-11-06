@@ -70,16 +70,21 @@ class STTService:
         self,
         audio_queue: "asyncio.Queue[bytes | None]",
         language: str = "en-US",
-        endpointing: int = 500,
+        endpointing: int = 300,
         model: str = "nova-2",
         encoding: str = "linear16",
         sample_rate: str = "16000",
+        utterance_end_ms: Optional[int] = None,
     ) -> AsyncGenerator[tuple[str, dict], None]:
         # Normalize language code for Deepgram STT (e.g. 'hi-IN' -> 'hi')
         if language and "-" in language:
             lang_code = language.split("-")[0].lower()
             if lang_code != "en":
                 language = lang_code
+
+        if utterance_end_ms is None:
+            from app.voice_config import voice_cfg
+            utterance_end_ms = voice_cfg.STT_UTTERANCE_END_MS
 
         query_items = [
             ("model", model),
@@ -92,6 +97,8 @@ class STTService:
             ("sample_rate", sample_rate),
             ("channels", "1"),
         ]
+        if utterance_end_ms:
+            query_items.append(("utterance_end_ms", str(utterance_end_ms)))
 
         # Nova-3 requires 'keyterm', while Nova-2 requires 'keywords'
         kw_param = "keyterm" if "nova-3" in model.lower() else "keywords"
@@ -135,7 +142,8 @@ class STTService:
                         while True:
                             chunk = await audio_queue.get()
                             if chunk is None:
-                                logger.info(f"[STT_SEND_FLOW] Encountered EOF (None in queue) at timestamp={time.time()}")
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(f"[STT_SEND_FLOW] Encountered EOF (None in queue) at timestamp={time.time()}")
                                 # Signal Deepgram we're done sending
                                 try:
                                     await dg_ws.send(json.dumps({"type": "CloseStream"}))
@@ -143,16 +151,18 @@ class STTService:
                                     pass
                                 return
                             
-                            logger.info(
-                                f"[STT_SEND_FLOW] Dequeued chunk from audio_queue at timestamp={time.time()}, "
-                                f"bytes={len(chunk)}, current_queue_size={audio_queue.qsize()}"
-                            )
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(
+                                    f"[STT_SEND_FLOW] Dequeued chunk from audio_queue at timestamp={time.time()}, "
+                                    f"bytes={len(chunk)}, current_queue_size={audio_queue.qsize()}"
+                                )
                             try:
                                 await dg_ws.send(chunk)
-                                logger.info(
-                                    f"[STT_SEND_FLOW] Sent chunk to Deepgram at timestamp={time.time()}, "
-                                    f"dg_ws_state={getattr(dg_ws, 'state', 'unknown')}"
-                                )
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(
+                                        f"[STT_SEND_FLOW] Sent chunk to Deepgram at timestamp={time.time()}, "
+                                        f"dg_ws_state={getattr(dg_ws, 'state', 'unknown')}"
+                                    )
                             except Exception as exc:
                                 logger.warning(f"STT send error: {exc} at timestamp={time.time()}")
                                 return
@@ -176,7 +186,8 @@ class STTService:
 
                 try:
                     async for raw_msg in dg_ws:
-                        logger.info(f"[STT_RECV_FLOW] Raw msg from Deepgram at timestamp={time.time()}: {raw_msg[:200]}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"[STT_RECV_FLOW] Raw msg from Deepgram at timestamp={time.time()}: {raw_msg[:200]}")
                         if not isinstance(raw_msg, str):
                             continue
                         try:
@@ -194,7 +205,7 @@ class STTService:
                             is_final: bool = msg.get("is_final", False)
                             speech_final: bool = msg.get("speech_final", False)
 
-                            if not transcript:
+                            if not transcript and not speech_final:
                                 continue
 
                             payload = {

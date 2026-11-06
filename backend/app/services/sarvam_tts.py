@@ -162,7 +162,7 @@ class SarvamTTSService:
                 
                 latency = int((time.time() - start_time) * 1000)
                 from app.services.provider_health_service import log_provider_health_event
-                log_provider_health_event("sarvam", "tts", "success", latency_ms=latency)
+                asyncio.create_task(asyncio.to_thread(log_provider_health_event, "sarvam", "tts", "success", latency_ms=latency))
 
                 if req_codec == "linear16":
                     # Strip WAV header if present to extract raw PCM bytes
@@ -191,7 +191,7 @@ class SarvamTTSService:
             latency = int((time.time() - start_time) * 1000)
             from app.services.provider_health_service import log_provider_health_event
             status = "429_rate_limited" if "429" in str(exc) else "failure"
-            log_provider_health_event("sarvam", "tts", status, latency_ms=latency, error_code="API_ERROR", error_message=str(exc))
+            asyncio.create_task(asyncio.to_thread(log_provider_health_event, "sarvam", "tts", status, latency_ms=latency, error_code="API_ERROR", error_message=str(exc)))
             logger.error("Sarvam TTS synthesis failed: %s. Falling back to Deepgram.", exc)
             return await self._fallback_synthesize(text)
 

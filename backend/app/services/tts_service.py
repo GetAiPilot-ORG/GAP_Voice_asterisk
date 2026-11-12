@@ -40,7 +40,7 @@ class TTSService:
                         res_bytes = await resp.read()
                         latency = int((time.time() - start_time) * 1000)
                         from app.services.provider_health_service import log_provider_health_event
-                        log_provider_health_event("deepgram", "tts", "success", latency_ms=latency)
+                        asyncio.create_task(asyncio.to_thread(log_provider_health_event, "deepgram", "tts", "success", latency_ms=latency))
                         return res_bytes
                     error_text = await resp.text()
                     logger.error("Deepgram TTS REST failed: %s - %s", resp.status, error_text)
@@ -49,7 +49,7 @@ class TTSService:
             latency = int((time.time() - start_time) * 1000)
             from app.services.provider_health_service import log_provider_health_event
             status = "429_rate_limited" if "429" in str(e) else "failure"
-            log_provider_health_event("deepgram", "tts", status, latency_ms=latency, error_code="REST_ERROR", error_message=str(e))
+            asyncio.create_task(asyncio.to_thread(log_provider_health_event, "deepgram", "tts", status, latency_ms=latency, error_code="REST_ERROR", error_message=str(e)))
             logger.error("TTS synthesize failed: %s", e)
             raise
 
@@ -112,13 +112,13 @@ class TTSService:
             res_bytes = b"".join(chunks)
             latency = int((time.time() - start_time) * 1000)
             from app.services.provider_health_service import log_provider_health_event
-            log_provider_health_event("deepgram", "tts", "success", latency_ms=latency)
+            asyncio.create_task(asyncio.to_thread(log_provider_health_event, "deepgram", "tts", "success", latency_ms=latency))
             return res_bytes
         except Exception as e:
             latency = int((time.time() - start_time) * 1000)
             from app.services.provider_health_service import log_provider_health_event
             status = "429_rate_limited" if "429" in str(e) else "failure"
-            log_provider_health_event("deepgram", "tts", status, latency_ms=latency, error_code="WS_ERROR", error_message=str(e))
+            asyncio.create_task(asyncio.to_thread(log_provider_health_event, "deepgram", "tts", status, latency_ms=latency, error_code="WS_ERROR", error_message=str(e)))
             raise
 
 
@@ -170,8 +170,7 @@ class WarmTTSConnection:
             await self._connect_task
 
     async def speak(self, text: str) -> AsyncGenerator[bytes, None]:
-        """Send text and yield audio bytes until Flushed."""
-        audio_chunks = []
+        """Send text and yield audio bytes incrementally as they arrive."""
         async with self._lock:
             if self._ws is None or self._ws.state != websockets.State.OPEN:
                 await self.connect()
@@ -183,7 +182,7 @@ class WarmTTSConnection:
 
                 async for msg in ws:
                     if isinstance(msg, bytes) and msg:
-                        audio_chunks.append(msg)
+                        yield msg
                     elif isinstance(msg, str):
                         try:
                             data = json.loads(msg)
@@ -196,9 +195,6 @@ class WarmTTSConnection:
                 self._ws = None
                 self._connect_task = None
                 raise
-
-        for chunk in audio_chunks:
-            yield chunk
 
     async def cancel(self) -> None:
         """Stop current synthesis (barge-in)."""

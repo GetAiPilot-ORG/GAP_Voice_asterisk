@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     PUNCTUATION_RESTORE: bool = False
     FIRST_CHUNK_TIMEOUT_MS: int = 0
     NEXT_CHUNK_TIMEOUT_MS: int = 1200
-    DISABLE_STREAMING_TTS: bool = True
+    DISABLE_STREAMING_TTS: bool = False  # Set to True for full-response fallback
     TTS_PREBUFFER_MS: int = 1500
     MIN_AUDIO_CHUNKS_BEFORE_PLAYBACK: int = 2
 

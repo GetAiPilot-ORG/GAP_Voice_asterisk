@@ -69,6 +69,10 @@ async def lifespan(app: FastAPI):
     # Start the local scheduler loop in the background
     asyncio.create_task(start_local_scheduler())
 
+    # Start OpenAI LLM connection pool keep-warm task
+    from app.services.llm_service import start_llm_keep_warm, stop_llm_keep_warm
+    start_llm_keep_warm()
+
     # Start Asterisk startup diagnostic checks in the background
     asyncio.create_task(run_asterisk_startup_checks())
 
@@ -83,6 +87,13 @@ async def lifespan(app: FastAPI):
         )
 
     yield
+
+    # Stop OpenAI keep-warm task
+    try:
+        from app.services.llm_service import stop_llm_keep_warm
+        stop_llm_keep_warm()
+    except Exception:
+        pass
 
     # Stop the Audiosocket TCP server gracefully on server shutdown.
     if settings.asterisk_audiosocket_enabled:

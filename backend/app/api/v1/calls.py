@@ -6,6 +6,7 @@ from app.services.telephony_service import TelephonyService
 import logging
 import subprocess
 import shlex
+import re
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -234,11 +235,12 @@ async def test_call(
     db: Client = Depends(get_db),
 ):
     """Place an outbound test call to verify an agent's telephony integration."""
-    to_number: str = body.get("to_number", "").strip()
-    if not to_number:
+    raw_to: str = body.get("to_number", "").strip()
+    if not raw_to:
         raise HTTPException(status_code=400, detail="to_number is required")
         
-    # Ensure to_number starts with '+' to conform to E.164 preflight safety regex
+    # Sanitize whitespace, dashes, parens, and ensure leading '+' for E.164 compliance
+    to_number = re.sub(r"[\s\-\(\)\.]+", "", raw_to)
     if not to_number.startswith("+"):
         to_number = "+" + to_number
 
@@ -682,7 +684,10 @@ async def asterisk_outbound_call(body: Dict[str, Any], db: Client = Depends(get_
     Accepts an optional call_id and trunk_id when called from the test-call endpoint
     (so the UUID stays consistent between the registered session and the originate command).
     """
-    to_number = body.get("to_number", "").strip()
+    raw_to = body.get("to_number", "").strip()
+    to_number = re.sub(r"[\s\-\(\)\.]+", "", raw_to)
+    if to_number and not to_number.startswith("+"):
+        to_number = "+" + to_number
     from_number = body.get("from_number", "").strip()
     workspace_id = body.get("workspace_id", "").strip()
     agent_id = body.get("agent_id", "").strip()

@@ -162,7 +162,7 @@ class SarvamTTSService:
                 
                 latency = int((time.time() - start_time) * 1000)
                 from app.services.provider_health_service import log_provider_health_event
-                log_provider_health_event("sarvam", "tts", "success", latency_ms=latency)
+                asyncio.create_task(asyncio.to_thread(log_provider_health_event, "sarvam", "tts", "success", latency_ms=latency))
 
                 if req_codec == "linear16":
                     # Strip WAV header if present to extract raw PCM bytes
@@ -191,7 +191,7 @@ class SarvamTTSService:
             latency = int((time.time() - start_time) * 1000)
             from app.services.provider_health_service import log_provider_health_event
             status = "429_rate_limited" if "429" in str(exc) else "failure"
-            log_provider_health_event("sarvam", "tts", status, latency_ms=latency, error_code="API_ERROR", error_message=str(exc))
+            asyncio.create_task(asyncio.to_thread(log_provider_health_event, "sarvam", "tts", status, latency_ms=latency, error_code="API_ERROR", error_message=str(exc)))
             logger.error("Sarvam TTS synthesis failed: %s. Falling back to Deepgram.", exc)
             return await self._fallback_synthesize(text)
 
@@ -264,6 +264,7 @@ class WarmSarvamConnection:
     """
     Long-lived Sarvam TTS WebSocket connection for a session.
     Keeps the connection open; caller sends sentences one at a time.
+    Supports lightweight keepalive ping and one reconnect-retry on stale socket.
     """
     def __init__(
         self,
@@ -283,13 +284,26 @@ class WarmSarvamConnection:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._lock = asyncio.Lock()
         self._connect_task: Optional[asyncio.Task] = None
+        self._keepalive_task: Optional[asyncio.Task] = None
+
+    async def _keepalive_loop(self):
+        """Sends periodic ping to prevent firewall/NAT idle disconnects."""
+        while True:
+            await asyncio.sleep(15)
+            try:
+                if self._ws and self._ws.state == websockets.State.OPEN:
+                    pong_waiter = await self._ws.ping()
+                    await asyncio.wait_for(pong_waiter, timeout=5.0)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.debug(f"[WarmSarvam] Keepalive ping error: {e}")
 
     async def connect(self) -> None:
         if self._ws and self._ws.state == websockets.State.OPEN:
             return
 
         async with self._lock:
-            # Re-check inside lock
             if self._ws and self._ws.state == websockets.State.OPEN:
                 return
 
@@ -299,15 +313,10 @@ class WarmSarvamConnection:
                     headers = {"api-subscription-key": self.api_key}
                     self._ws = await websockets.connect(url, additional_headers=headers, ping_interval=None)
                     
-                    # Map output codec names
                     codec = self.output_audio_codec
-                    if codec == "pcm":
-                        codec = "linear16"
-                    elif codec == "pcm_8k":
-                        # 8kHz linear16: avoids the need for any local resampling
+                    if codec in ("pcm", "pcm_8k"):
                         codec = "linear16"
 
-                    # Send configuration message first
                     config_msg = {
                         "type": "config",
                         "data": {
@@ -320,78 +329,111 @@ class WarmSarvamConnection:
                     }
                     if self.output_audio_codec == "pcm":
                         config_msg["data"]["speech_sample_rate"] = 16000
-                    elif self.output_audio_codec == "pcm_8k":
-                        config_msg["data"]["speech_sample_rate"] = 8000
-                    elif codec == "mulaw":
+                    elif self.output_audio_codec in ("pcm_8k", "mulaw"):
                         config_msg["data"]["speech_sample_rate"] = 8000
 
                     await self._ws.send(json.dumps(config_msg))
                     logger.info("Warm Sarvam TTS WS connected (speaker=%s, lang=%s, codec=%s)", self.speaker, self.language, codec)
 
+                    if self._keepalive_task and not self._keepalive_task.done():
+                        self._keepalive_task.cancel()
+                    self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
                 self._connect_task = asyncio.create_task(_do_connect())
 
             await self._connect_task
 
-    async def speak(self, text: str) -> AsyncGenerator[bytes, None]:
-        """Send text and yield audio bytes until flushed."""
-        text = prepare_for_tts(text)
-        audio_chunks = []
+    def ensure_connected_soon(self) -> None:
+        """Schedules background reconnection so the next turn does not pay latency on critical path."""
         if self._ws is None or self._ws.state != websockets.State.OPEN:
-            await self.connect()
+            asyncio.create_task(self.connect())
 
-        async with self._lock:
+    async def speak(self, text: str) -> AsyncGenerator[bytes, None]:
+        """Send text and yield audio bytes until flushed. Retries once if socket died before audio."""
+        text = prepare_for_tts(text)
+        if not text.strip():
+            return
 
-            ws = self._ws
-            try:
-                # Send text payload
-                text_msg = {
-                    "type": "text",
-                    "data": {
-                        "text": text
+        audio_yielded = False
+        max_attempts = 2
+
+        for attempt in range(max_attempts):
+            if self._ws is None or self._ws.state != websockets.State.OPEN:
+                await self.connect()
+
+            async with self._lock:
+                ws = self._ws
+                try:
+                    # Send text payload
+                    text_msg = {
+                        "type": "text",
+                        "data": {
+                            "text": text
+                        }
                     }
-                }
-                await ws.send(json.dumps(text_msg))
-                
-                # Send flush payload
-                flush_msg = {
-                    "type": "flush"
-                }
-                await ws.send(json.dumps(flush_msg))
+                    await ws.send(json.dumps(text_msg))
+                    
+                    # Send flush payload
+                    flush_msg = {
+                        "type": "flush"
+                    }
+                    await ws.send(json.dumps(flush_msg))
 
-                # Receive all audio chunks
-                logger.info("[WarmSarvam] Entering websocket receive loop...")
-                async for raw_msg in ws:
-                    logger.info("[WarmSarvam] Received raw message: %s", raw_msg[:200])
-                    msg = json.loads(raw_msg)
-                    msg_type = msg.get("type")
-                    if msg_type == "audio":
-                        audio_b64 = msg.get("data", {}).get("audio", "")
-                        if audio_b64:
-                            yield base64.b64decode(audio_b64)
-                    elif msg_type == "flushed":
-                        break
-                    elif msg_type == "event":
-                        event_type = msg.get("data", {}).get("event_type")
-                        if event_type in ("final", "completion"):
+                    # Receive all audio chunks
+                    logger.debug("[WarmSarvam] Entering websocket receive loop...")
+                    async for raw_msg in ws:
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug("[WarmSarvam] Received raw message: %s", raw_msg[:200])
+                        msg = json.loads(raw_msg)
+                        msg_type = msg.get("type")
+                        if msg_type == "audio":
+                            audio_b64 = msg.get("data", {}).get("audio", "")
+                            if audio_b64:
+                                audio_yielded = True
+                                yield base64.b64decode(audio_b64)
+                        elif msg_type == "flushed":
                             break
-                    elif msg_type == "error":
-                        error_msg = msg.get("data", {}).get("message", "Unknown Sarvam WS error")
-                        raise RuntimeError(f"Sarvam WS error: {error_msg}")
-            except BaseException as exc:
-                logger.error("WarmSarvam speak error or cancellation: %s", exc)
-                if self._ws:
-                    try:
-                        await self._ws.close()
-                    except Exception:
-                        pass
-                self._ws = None
-                self._connect_task = None
-                raise
+                        elif msg_type == "event":
+                            event_type = msg.get("data", {}).get("event_type")
+                            if event_type in ("final", "completion"):
+                                break
+                        elif msg_type == "error":
+                            error_msg = msg.get("data", {}).get("message", "Unknown Sarvam WS error")
+                            raise RuntimeError(f"Sarvam WS error: {error_msg}")
+                    return  # Success: finished sentence
 
-        # Streamed in real-time above
-        pass
+                except asyncio.CancelledError:
+                    logger.info("[WarmSarvam] speak cancelled (barge-in)")
+                    if self._ws:
+                        try:
+                            await self._ws.close()
+                        except Exception:
+                            pass
+                    self._ws = None
+                    self._connect_task = None
+                    raise
+
+                except Exception as exc:
+                    logger.warning(f"WarmSarvam speak error on attempt {attempt+1}: {exc}")
+                    if self._ws:
+                        try:
+                            await self._ws.close()
+                        except Exception:
+                            pass
+                    self._ws = None
+                    self._connect_task = None
+
+                    if audio_yielded or attempt >= max_attempts - 1:
+                        # Already yielded audio or exhausted retries: do not duplicate speech
+                        raise
+                    logger.info("[WarmSarvam] Reconnecting and retrying sentence synthesis...")
+                    continue
 
     async def close(self) -> None:
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
+
         if self._ws and self._ws.state == websockets.State.OPEN:
             try:
                 await self._ws.close()

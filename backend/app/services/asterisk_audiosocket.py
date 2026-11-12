@@ -1,3 +1,4 @@
+from __future__ import annotations
 import hashlib
 from collections import OrderedDict
 
@@ -10,7 +11,7 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, AsyncGenerator
 
 import traceback
 import websockets

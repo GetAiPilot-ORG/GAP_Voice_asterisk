@@ -192,7 +192,16 @@ class CallSessionManager:
                     cost_data["call_id"] = call_uuid
                     cost_data["cost_status"] = "final"
                     cost_data["cost_finalized_at"] = datetime.now(timezone.utc).isoformat()
-                    db.table("call_usage").upsert(cost_data, on_conflict="call_id").execute()
+                    try:
+                        db.table("call_usage").upsert(cost_data, on_conflict="call_id").execute()
+                    except Exception as usage_err:
+                        # Fallback if credits_used is not in the call_usage schema cache
+                        if "credits_used" in cost_data:
+                            safe_cost_data = {k: v for k, v in cost_data.items() if k != "credits_used"}
+                            try:
+                                db.table("call_usage").upsert(safe_cost_data, on_conflict="call_id").execute()
+                            except Exception:
+                                pass
 
                 # Update workspace monthly usage counter
                 workspace_id = context.get("workspace_id")

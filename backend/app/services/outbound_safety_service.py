@@ -239,12 +239,16 @@ async def verify_outbound_dial_safety(
                     return res
 
         # 4. Destination Phone Format Validation
-        phone_clean = phone_number.strip()
+        raw_phone = phone_number.strip() if phone_number else ""
+        phone_clean = re.sub(r"[\s\-\(\)\.]+", "", raw_phone)
+        if phone_clean and not phone_clean.startswith("+"):
+            phone_clean = "+" + phone_clean
+
         if not phone_clean or not re.match(r"^\+[1-9]\d{1,14}$", phone_clean):
             res = DialSafetyResult(
                 allowed=False,
                 reason_code="invalid_number",
-                human_readable_reason=f"Phone number '{phone_clean}' is not valid E.164 format",
+                human_readable_reason=f"Phone number '{raw_phone}' is not valid E.164 format",
                 safe_to_retry=False,
                 should_pause_campaign=False
             )

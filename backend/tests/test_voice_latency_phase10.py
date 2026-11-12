@@ -259,3 +259,56 @@ def test_llm_client_caching_and_non_blocking_logging():
     # Different key -> different client
     client3 = get_openai_client("test-key-phase10-67890")
     assert client1 is not client3
+
+
+# --------------------------------------------------------------------------
+# Test 7: E.164 Phone Sanitization & Preflight Safety
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_e164_phone_sanitization_safety():
+    """
+    Verifies that phone numbers with spaces, hyphens, and missing '+' are sanitized
+    correctly and pass E.164 validation without getting falsely rejected.
+    """
+    from app.services.outbound_safety_service import verify_outbound_dial_safety
+
+    # Mock DB and redis to pass previous checks and focus on phone validation
+    with patch("app.services.outbound_safety_service.get_supabase_client") as mock_db, \
+         patch("app.services.outbound_safety_service.get_kill_switch_enabled", return_value=True), \
+         patch("app.services.outbound_safety_service.check_circuit_breaker", return_value=(False, "")):
+        
+        # Setup workspace mock
+        mock_db_instance = MagicMock()
+        mock_db.return_value = mock_db_instance
+        mock_db_instance.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [{"status": "active"}]
+
+        # 1. Number with spaces
+        res = await verify_outbound_dial_safety(
+            workspace_id="ws-123",
+            agent_id="agent-123",
+            phone_number="+9189822 85510",
+            call_uuid="uuid-1",
+            dry_run=True
+        )
+        assert res.allowed is True
+
+        # 2. Number with hyphens
+        res_hyphen = await verify_outbound_dial_safety(
+            workspace_id="ws-123",
+            agent_id="agent-123",
+            phone_number="+91-89822-85510",
+            call_uuid="uuid-2",
+            dry_run=True
+        )
+        assert res_hyphen.allowed is True
+
+        # 3. Truly invalid number
+        res_bad = await verify_outbound_dial_safety(
+            workspace_id="ws-123",
+            agent_id="agent-123",
+            phone_number="not-a-number",
+            call_uuid="uuid-3",
+            dry_run=True
+        )
+        assert res_bad.allowed is False
+        assert res_bad.reason_code == "invalid_number"

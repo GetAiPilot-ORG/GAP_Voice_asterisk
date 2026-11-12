@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
 import traceback
+import websockets
 
 from app.core.config import settings
 from app.db.client import get_supabase_client

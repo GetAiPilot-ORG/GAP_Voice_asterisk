@@ -113,7 +113,7 @@ async def start_local_scheduler():
     logger.info("Starting local fallback scheduler loop (no Redis required)")
     while True:
         try:
-            count = poll_and_dispatch(use_celery=False)
+            count = await asyncio.to_thread(poll_and_dispatch, False)
             if count > 0:
                 logger.info(f"Local Scheduler: Executed {count} tasks")
         except Exception as e:

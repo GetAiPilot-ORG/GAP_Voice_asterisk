@@ -424,6 +424,7 @@ class AsteriskVoiceSession:
         offset = 0
         total_bytes = len(pcm_8k)
         next_send_time = time.monotonic()
+        frame_count = 0
         logger.info(f"[Greeting] Playing cached greeting ({total_bytes} bytes, ~{int(total_bytes/16)}ms) for call {self.call_uuid}")
 
         try:
@@ -439,6 +440,9 @@ class AsteriskVoiceSession:
                 packet = bytes([0x10]) + len(chunk).to_bytes(2, "big") + chunk
                 async with self._writer_lock:
                     self.writer.write(packet)
+
+                frame_count += 1
+                if frame_count % 10 == 0:
                     try:
                         await self.writer.drain()
                     except Exception as e:
@@ -452,6 +456,11 @@ class AsteriskVoiceSession:
                     next_send_time = now
                 elif behind < 0:
                     await asyncio.sleep(-behind)
+
+            try:
+                await self.writer.drain()
+            except Exception:
+                pass
 
             self.messages.append({'role': 'assistant', 'content': greeting_text})
         finally:

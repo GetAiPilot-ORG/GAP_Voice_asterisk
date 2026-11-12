@@ -114,7 +114,7 @@ class AsteriskConfigGenerator:
  
         pjsip_conf = "\n".join(pjsip_lines)
  
-        base_api_url = settings.public_base_url or 'http://127.0.0.1:8000'
+        base_api_url = settings.public_base_url or f"http://127.0.0.1:{settings.api_port}"
         # 2. Extensions config generation
         ext_lines = [
             f"; === Inbound Routing for Provider: {name} (ID: {trunk_id}) ===",

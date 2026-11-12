@@ -1,7 +1,8 @@
+from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 from urllib.parse import urlencode
 
 import httpx

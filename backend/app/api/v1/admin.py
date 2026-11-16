@@ -1162,12 +1162,13 @@ async def get_system_health(
     except Exception:
         asterisk_process = "running (simulated)"
 
-    # AudioSocket port 9092 check
+    # AudioSocket port check
+    as_port = settings.asterisk_audiosocket_port or 9092
     audiosocket_port_open = False
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(1.0)
-        s.connect(("127.0.0.1", 9092))
+        s.connect(("127.0.0.1", int(as_port)))
         audiosocket_port_open = True
         s.close()
     except Exception:
@@ -1241,7 +1242,7 @@ async def get_system_health(
         "pm2_status": pm2_status,
         "ports": {
             "8000 (API)": True,
-            "9092 (AudioSocket)": audiosocket_port_open,
+            f"{as_port} (AudioSocket)": audiosocket_port_open,
             "5060 (SIP UDP)": True,
             "10000-20000 (RTP)": True
         },
@@ -1866,10 +1867,11 @@ async def get_outbound_safety_status(
             pass
             
     # 3. Asterisk status
+    as_port = settings.asterisk_audiosocket_port or 9092
     asterisk_healthy = False
     if settings.asterisk_mode == "local":
         try:
-            with socket.create_connection(("127.0.0.1", 9092), timeout=1.0):
+            with socket.create_connection(("127.0.0.1", int(as_port)), timeout=1.0):
                 asterisk_healthy = True
         except Exception:
             pass
@@ -1895,7 +1897,7 @@ async def get_outbound_safety_status(
     if cb_tripped:
         blocking_reasons.append(f"Circuit breaker is OPEN: {cb_reason}")
     if not asterisk_healthy:
-        blocking_reasons.append("Asterisk AudioSocket listener is offline on port 9092.")
+        blocking_reasons.append(f"Asterisk AudioSocket listener is offline on port {as_port}.")
 
     return {
         "switches": switches,

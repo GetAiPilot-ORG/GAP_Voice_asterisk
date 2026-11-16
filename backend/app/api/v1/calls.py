@@ -1004,13 +1004,15 @@ async def asterisk_diagnostics():
     
     detected_errors = []
     
-    # 1. Check AudioSocket 9092
+    # 1. Check AudioSocket listener
     audiosocket_listening = False
+    as_host = settings.asterisk_audiosocket_host or "127.0.0.1"
+    as_port = settings.asterisk_audiosocket_port or 9092
     try:
-        with socket.create_connection(("127.0.0.1", 9092), timeout=1.0) as s:
+        with socket.create_connection((as_host, as_port), timeout=1.0) as s:
             audiosocket_listening = True
     except Exception as e:
-        detected_errors.append(f"AudioSocket not listening on 9092: {e}")
+        detected_errors.append(f"AudioSocket not listening on {as_host}:{as_port}: {e}")
         
     # 2. Check Asterisk CLI Execution
     can_execute = False

@@ -34,10 +34,11 @@ async def run_asterisk_startup_checks():
     
     # 1. Check AudioSocket listener
     from app.api.v1.calls import is_audiosocket_listening
+    as_port = settings.asterisk_audiosocket_port or 9092
     if is_audiosocket_listening():
-        logger.info("[Startup Check] AudioSocket TCP listener is ACTIVE on 127.0.0.1:9092")
+        logger.info(f"[Startup Check] AudioSocket TCP listener is ACTIVE on 127.0.0.1:{as_port}")
     else:
-        logger.warning("[Startup Check] AudioSocket TCP listener is NOT active on 127.0.0.1:9092. Outbound calls will fail locally!")
+        logger.warning(f"[Startup Check] AudioSocket TCP listener is NOT active on 127.0.0.1:{as_port}. Outbound calls will fail locally!")
         
     # 2. Check Asterisk CLI availability
     from app.services.asterisk_cli import execute_asterisk_cli_cmd

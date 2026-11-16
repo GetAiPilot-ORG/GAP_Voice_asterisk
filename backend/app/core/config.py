@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     asterisk_audiosocket_port: int = 9092
     asterisk_webhook_secret: Optional[str] = None
     api_host: str = "0.0.0.0"
-    api_port: int = 8000
+    api_port: int = 8010
     api_workers: int = 4
     
     # App

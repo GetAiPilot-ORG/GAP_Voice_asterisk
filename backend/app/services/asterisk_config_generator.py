@@ -114,7 +114,8 @@ class AsteriskConfigGenerator:
  
         pjsip_conf = "\n".join(pjsip_lines)
  
-        base_api_url = settings.public_base_url or 'http://127.0.0.1:8000'
+        base_api_url = settings.public_base_url or f"http://127.0.0.1:{settings.api_port}"
+        as_port = settings.asterisk_audiosocket_port or 9092
         # 2. Extensions config generation
         ext_lines = [
             f"; === Inbound Routing for Provider: {name} (ID: {trunk_id}) ===",
@@ -128,7 +129,7 @@ class AsteriskConfigGenerator:
             " same => n(reject_num),NoOp(Call rejected: ${CALL_PERMISSION})",
             " same => n,Hangup(21)",
             " same => n(curl_ok_num),Answer()",
-            " same => n,AudioSocket(${CALL_UUID},127.0.0.1:9092)",
+            f" same => n,AudioSocket(${{CALL_UUID}},127.0.0.1:{as_port})",
             " same => n,Hangup()",
             "",
             "; 2. Match numeric extensions with leading +",
@@ -139,7 +140,7 @@ class AsteriskConfigGenerator:
             " same => n(reject_plus),NoOp(Call rejected: ${CALL_PERMISSION})",
             " same => n,Hangup(21)",
             " same => n(curl_ok_plus),Answer()",
-            " same => n,AudioSocket(${CALL_UUID},127.0.0.1:9092)",
+            f" same => n,AudioSocket(${{CALL_UUID}},127.0.0.1:{as_port})",
             " same => n,Hangup()",
             "",
             "; 3. Match s extension (default routing)",
@@ -150,7 +151,7 @@ class AsteriskConfigGenerator:
             " same => n(reject_s),NoOp(Call rejected: ${CALL_PERMISSION})",
             " same => n,Hangup(21)",
             " same => n(curl_ok_s),Answer()",
-            " same => n,AudioSocket(${CALL_UUID},127.0.0.1:9092)",
+            f" same => n,AudioSocket(${{CALL_UUID}},127.0.0.1:{as_port})",
             " same => n,Hangup()",
         ]
         extensions_conf = "\n".join(ext_lines)

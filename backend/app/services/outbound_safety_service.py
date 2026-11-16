@@ -348,8 +348,10 @@ async def verify_outbound_dial_safety(
             if settings.asterisk_mode == "local":
                 import socket
                 audiosocket_listening = False
+                as_host = settings.asterisk_audiosocket_host or "127.0.0.1"
+                as_port = settings.asterisk_audiosocket_port or 9092
                 try:
-                    with socket.create_connection(("127.0.0.1", 9092), timeout=1.0):
+                    with socket.create_connection((as_host, as_port), timeout=1.0):
                         audiosocket_listening = True
                 except Exception:
                     pass
@@ -357,7 +359,7 @@ async def verify_outbound_dial_safety(
                     res = DialSafetyResult(
                         allowed=False,
                         reason_code="asterisk_unavailable",
-                        human_readable_reason="Local AudioSocket listener is not active on port 9092",
+                        human_readable_reason=f"Local AudioSocket listener is not active on {as_host}:{as_port}",
                         safe_to_retry=True,
                         should_pause_campaign=True
                     )

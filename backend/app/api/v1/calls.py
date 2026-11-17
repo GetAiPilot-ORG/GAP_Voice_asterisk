@@ -443,6 +443,15 @@ async def test_call(
                 from app.services.asterisk_cli import verify_endpoint_status
                 validation = verify_endpoint_status(endpoint_name)
                 if validation["status"] == "missing":
+                    for fallback_name in ["provider-24ithub", "provider-trunk"]:
+                        fallback_check = verify_endpoint_status(fallback_name)
+                        if fallback_check["status"] == "valid":
+                            logger.info(f"[Asterisk Test Call] Endpoint '{endpoint_name}' not found, falling back to valid endpoint '{fallback_name}'")
+                            endpoint_name = fallback_name
+                            validation = fallback_check
+                            break
+
+                if validation["status"] == "missing":
                     raise HTTPException(
                         status_code=400,
                         detail=validation["message"]

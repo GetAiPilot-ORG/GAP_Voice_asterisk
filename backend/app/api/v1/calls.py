@@ -425,7 +425,8 @@ async def test_call(
         if caller_id.startswith('+'):
             caller_id = caller_id[1:]
 
-        originate_cmd_str = f"asterisk -rx 'channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}'"
+        # Answer-gated originate: PJSIP channel originates directly, executes outbound-ai-answered ONLY upon answer
+        originate_cmd_str = f"asterisk -rx 'channel originate PJSIP/{dial_number}@{endpoint_name} extension {call_id}@outbound-ai-answered'"
 
         call_originated = False
 
@@ -462,8 +463,8 @@ async def test_call(
                         detail=f"Asterisk connection issue: {validation['message']}"
                     )
                     
-                # 3. Execute local originate command directly (no SSH fallback, return errors)
-                originate_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}"
+                # 3. Execute answer-gated originate directly
+                originate_cmd = f"channel originate PJSIP/{dial_number}@{endpoint_name} extension {call_id}@outbound-ai-answered"
                 res = execute_asterisk_cli(originate_cmd)
                 if res["returncode"] != 0:
                     raise HTTPException(
@@ -541,7 +542,7 @@ async def test_call(
                         ssh_cmd += ["-i", ssh_key]
                     ssh_cmd += [
                         f"{ssh_user}@{ssh_host}",
-                        f"asterisk -rx 'channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}'"
+                        f"asterisk -rx 'channel originate PJSIP/{dial_number}@{endpoint_name} extension {call_id}@outbound-ai-answered'"
                     ]
                     try:
                         # Increased timeout to 60 seconds to accommodate network/routing latency
@@ -557,11 +558,11 @@ async def test_call(
                 # Strategy 3: Run asterisk locally (only if not on Windows or as last resort local fallback)
                 if not call_originated:
                     import platform
+                    orig_cmd = f"channel originate PJSIP/{dial_number}@{endpoint_name} extension {call_id}@outbound-ai-answered"
                     if platform.system() == "Windows":
-                        orig_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}"
                         cmd = ["wsl", "-u", "root", "bash", "-c", f"asterisk -rx {shlex.quote(orig_cmd)}"]
                     else:
-                        cmd = ["asterisk", "-rx", f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}"]
+                        cmd = ["asterisk", "-rx", orig_cmd]
                     try:
                         # Increased timeout to 60 seconds to accommodate slow WSL start/execution latency
                         res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -915,18 +916,20 @@ async def asterisk_outbound_call(body: Dict[str, Any], db: Client = Depends(get_
         provider_type = "custom"
         
     if provider_type != "twilio":
+        # 24IThub and Indian SIP trunks require 91XXXXXXXXXX without '+' prefix
         if dial_number.startswith('+'):
-            if dial_number.startswith('+91'):
-                dial_number = dial_number[1:]
-                
-    # Ensure dial_number has '+' prefix
-    if not dial_number.startswith('+'):
-        dial_number = '+' + dial_number
+            dial_number = dial_number[1:]
+    else:
+        if not dial_number.startswith('+'):
+            dial_number = '+' + dial_number
             
     endpoint_name = f"provider-{trunk_id}"
-    caller_id = from_number or "+18166536732"
+    caller_id = from_number or "911168140253"
+    if caller_id.startswith('+'):
+        caller_id = caller_id[1:]
 
-    orig_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_uuid},127.0.0.1:{settings.asterisk_audiosocket_port}"
+    # Answer-gated originate: PJSIP channel originates directly, executes outbound-ai-answered ONLY upon answer
+    orig_cmd = f"channel originate PJSIP/{dial_number}@{endpoint_name} extension {call_uuid}@outbound-ai-answered"
 
     call_originated = False
 

@@ -79,19 +79,37 @@ class CallSessionManager:
                     agent = await asyncio.to_thread(fetch_agent_with_context, db, agent_id)
                     if agent:
                         kb_meta = agent.get("kb_metadata") or {}
+                        lang = agent.get("language") or "hi-IN"
+                        raw_voice_id = (agent.get("voice_id") or "").strip()
+                        raw_provider = (agent.get("voice_provider") or kb_meta.get("tts_provider") or "").lower()
+
+                        # Determine if this agent uses Sarvam (Hindi/Hinglish or explicit Sarvam voice/provider)
+                        is_sarvam_voice = raw_voice_id.lower() in ("shreya", "shubh", "meera", "manan", "ishita", "arjun")
+                        is_hindi_lang = lang.lower().startswith("hi")
+
+                        if is_sarvam_voice or raw_provider == "sarvam" or (is_hindi_lang and raw_provider not in ("elevenlabs", "playht")):
+                            tts_provider = "sarvam"
+                            voice_id = raw_voice_id if raw_voice_id else "shreya"
+                        elif raw_provider == "elevenlabs":
+                            tts_provider = "elevenlabs"
+                            voice_id = raw_voice_id or "21m00Tcm4TlvDq8ikWAM"
+                        else:
+                            tts_provider = raw_provider or "deepgram"
+                            voice_id = raw_voice_id or "aura-asteria-en"
+
                         context["agent_config"] = {
                             "name": agent.get("name"),
-                            "model": agent.get("model"),
-                            "language": agent.get("language") or "hi-IN",
-                            "voice_id": agent.get("voice_id") or "aura-asteria-en",
-                            "tts_provider": kb_meta.get("tts_provider") or "deepgram",
+                            "model": agent.get("model") or "gpt-4o-mini",
+                            "language": lang,
+                            "voice_id": voice_id,
+                            "tts_provider": tts_provider,
                             "agent_system_prompt": agent.get("agent_system_prompt") or "",
                             "system_prompt": agent.get("system_prompt") or "",
                             "knowledge_base": agent.get("knowledge_base") or "",
                             "voice_gender": kb_meta.get("voice_gender") or "female",
-                            "voice_speed": agent.get("voice_speed"),
+                            "voice_speed": agent.get("voice_speed") or 1.0,
                         }
-                        logger.info(f"[CallSessionManager] Loaded agent config for call {call_uuid}")
+                        logger.info(f"[CallSessionManager] Loaded agent config for call {call_uuid}: provider={tts_provider}, voice={voice_id}, lang={lang}")
                 except Exception as e:
                     logger.error(f"[CallSessionManager] Failed to load agent details for call {call_uuid}: {e}")
             return context
@@ -177,9 +195,16 @@ class CallSessionManager:
 
         def _update():
             try:
+                # Map terminal call status accurately
+                terminal_status = "completed"
+                if reason in ("no_answer", "busy", "user_busy"):
+                    terminal_status = "no_answer" if "no_answer" in reason else "busy"
+                elif reason in ("call_rejected", "rejected", "failed", "cancelled", "did_inactive", "agent_not_found"):
+                    terminal_status = "failed"
+
                 # Update call row in DB
                 db.table("calls").update({
-                    "status": "completed",
+                    "status": terminal_status,
                     "ended_at": context["ended_at"],
                     "duration_seconds": duration,
                     "actual_duration": duration,

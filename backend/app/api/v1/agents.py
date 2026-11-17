@@ -13,6 +13,16 @@ VOICE_PROVIDER_MAP = {
     "eleven_multilingual_v2": "elevenlabs",
     "playht_2.0": "elevenlabs",
     "openai_tts": "elevenlabs",
+    "shreya": "sarvam",
+    "shubh": "sarvam",
+    "meera": "sarvam",
+    "manan": "sarvam",
+    "ishita": "sarvam",
+    "arjun": "sarvam",
+    "aura-asteria-en": "deepgram",
+    "aura-luna-en": "deepgram",
+    "aura-stella-en": "deepgram",
+    "aura-athena-en": "deepgram",
 }
 
 VIBE_MAP = {
@@ -112,8 +122,8 @@ async def create_agent(workspace_id: str, agent_data: Dict[str, Any], db: Client
         "system_prompt": system_prompt,
         "agent_system_prompt": agent_data.get("agent_system_prompt"),
         "voice_id": voice,
-        "voice_provider": VOICE_PROVIDER_MAP.get(voice, "elevenlabs"),
-        "language": agent_data.get("language", "en-US"),
+        "voice_provider": agent_data.get("voice_provider") or VOICE_PROVIDER_MAP.get(voice, "sarvam" if voice in ("shreya", "meera") else "elevenlabs"),
+        "language": agent_data.get("language", "hi-IN" if voice in ("shreya", "meera") else "en-US"),
         "interrupt_enabled": agent_data.get("allow_interruptions", True),
         "knowledge_base": agent_data.get("knowledge_base", ""),
         "kb_source_url": agent_data.get("website_url", "") or None,
@@ -200,7 +210,12 @@ async def update_agent(workspace_id: str, agent_id: str, agent_data: Dict[str, A
     if "voice" in agent_data:
         voice = agent_data["voice"]
         update_payload["voice_id"] = voice
-        update_payload["voice_provider"] = VOICE_PROVIDER_MAP.get(voice, "elevenlabs")
+        if "voice_provider" in agent_data:
+            update_payload["voice_provider"] = agent_data["voice_provider"]
+        else:
+            update_payload["voice_provider"] = VOICE_PROVIDER_MAP.get(voice, "sarvam" if voice in ("shreya", "meera") else "elevenlabs")
+    elif "voice_provider" in agent_data:
+        update_payload["voice_provider"] = agent_data["voice_provider"]
 
     # Handle kb_metadata merge
     existing_kb = existing.get("kb_metadata") or {}

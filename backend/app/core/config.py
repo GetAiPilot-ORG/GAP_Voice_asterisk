@@ -45,8 +45,8 @@ class Settings(BaseSettings):
     # Asterisk AudioSocket
     asterisk_audiosocket_enabled: bool = True
     asterisk_audiosocket_host: str = "127.0.0.1"
-    asterisk_audiosocket_port: int = 9092
-    asterisk_webhook_secret: Optional[str] = None
+    asterisk_audiosocket_port: int = 9095
+    asterisk_webhook_secret: Optional[str] = "your_shared_secret"
     api_host: str = "0.0.0.0"
     api_port: int = 8010
     api_workers: int = 4

@@ -722,14 +722,12 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
 
     if settings.asterisk_webhook_secret and not is_localhost and provided_secret != settings.asterisk_webhook_secret:
         logger.warning(f"[Asterisk Webhook] Unauthorized secret attempt from {client_host}")
-        from fastapi import HTTPException
-        raise HTTPException(status_code=401, detail="Invalid secret")
+        return Response(content="REJECT:unauthorized", media_type="text/plain")
     
     logger.info(f"[Asterisk Webhook] Inbound call trigger: caller={mask_phone_number(caller_id)}, DID={mask_phone_number(dialed_number)}, uuid={call_uuid}")
 
     if not call_uuid:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=400, detail="Missing call_uuid")
+        return Response(content="REJECT:missing_call_uuid", media_type="text/plain")
 
     # 3. Normalize dialed number and generate all Indian telecom variants (0-prefix, 91-prefix, +91, local 10-digit)
     search_variants = set()
@@ -918,5 +916,83 @@ async def _create_rejected_call_record(db, call_uuid, workspace_id, agent_id, ph
         await asyncio.to_thread(db.table("calls").insert(insert_payload).execute)
     except Exception as e:
         logger.error(f"[Asterisk Webhook] Failed to insert rejected call record: {e}")
+
+
+@router.get("/asterisk/answered")
+@router.post("/asterisk/answered")
+async def asterisk_answered(request: Request, db: Client = Depends(get_db)):
+    """
+    Called by Asterisk [outbound-ai-answered] context when destination answers.
+    Marks the call as in_progress and records answered timestamp.
+    """
+    params = await _request_params(request)
+    for k, v in request.query_params.items():
+        if k not in params:
+            params[k] = v
+
+    call_uuid = params.get("call_uuid") or params.get("uuid") or ""
+    if not call_uuid:
+        return Response(content="ERROR:missing_call_uuid", media_type="text/plain")
+
+    logger.info(f"[Asterisk Webhook] Outbound call ANSWERED: {call_uuid}")
+
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await asyncio.to_thread(
+            db.table("calls").update({
+                "status": "in_progress",
+                "started_at": now_iso
+            }).eq("call_uuid", call_uuid).execute
+        )
+    except Exception as e:
+        logger.error(f"[Asterisk Webhook] Failed to update call answered in DB: {e}")
+
+    return Response(content="OK", media_type="text/plain")
+
+
+@router.get("/asterisk/hangup")
+@router.post("/asterisk/hangup")
+async def asterisk_hangup(request: Request, db: Client = Depends(get_db)):
+    """
+    Called by Asterisk [call-hangup-handler] subroutine upon channel hangup.
+    Finalizes call state, records Q.850 hangup cause and billable duration.
+    """
+    params = await _request_params(request)
+    for k, v in request.query_params.items():
+        if k not in params:
+            params[k] = v
+
+    call_uuid = params.get("call_uuid") or params.get("uuid") or ""
+    cause_code = str(params.get("cause") or "").strip()
+    duration_str = params.get("duration") or "0"
+
+    try:
+        duration_sec = int(duration_str)
+    except ValueError:
+        duration_sec = 0
+
+    if not call_uuid:
+        return Response(content="ERROR:missing_call_uuid", media_type="text/plain")
+
+    logger.info(f"[Asterisk Webhook] Hangup reported for {call_uuid}: cause={cause_code}, duration={duration_sec}s")
+
+    # Map Q.850 causes
+    # 16: NORMAL_CLEARING, 17: USER_BUSY, 18/19: NO_ANSWER, 21: CALL_REJECTED
+    cause_map = {
+        "16": "normal_clearing",
+        "17": "user_busy",
+        "18": "no_answer",
+        "19": "no_answer",
+        "21": "call_rejected",
+        "34": "circuit_congestion",
+        "38": "network_out_of_order",
+    }
+    mapped_reason = cause_map.get(cause_code, f"q850_cause_{cause_code}" if cause_code else "hangup")
+
+    from app.services.call_session_manager import call_session_manager
+    call_session_manager.end_call(call_uuid, reason=mapped_reason)
+
+    return Response(content="OK", media_type="text/plain")
+
 
 

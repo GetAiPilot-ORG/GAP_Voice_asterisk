@@ -372,6 +372,10 @@ class AsteriskVoiceSession:
         starting speech in <50ms without waiting for LLM or TTS.
         Falls back to pipeline on cache miss and populates cache.
         """
+        if getattr(self, "greeting_played", False) or getattr(self, "greeting_active", False):
+            logger.info(f'[AsteriskVoiceSession] Greeting already played/active for call {self.call_uuid}, skipping duplicate trigger')
+            return
+
         logger.info(f'[AsteriskVoiceSession] Triggering initial greeting for call {self.call_uuid}')
         agent_id = self.config.get('agent_id') or self.context.get('agent_id') or 'default'
         voice_id = self.config.get('voice_id') or 'default'
@@ -439,11 +443,12 @@ class AsteriskVoiceSession:
                 packet = bytes([0x10]) + len(chunk).to_bytes(2, "big") + chunk
                 async with self._writer_lock:
                     self.writer.write(packet)
-                    try:
-                        await self.writer.drain()
-                    except Exception as e:
-                        logger.error(f"[Greeting] Drain error: {e}")
-                        break
+                    if offset % (320 * 10) == 0 or offset >= total_bytes:
+                        try:
+                            await self.writer.drain()
+                        except Exception as e:
+                            logger.error(f"[Greeting] Drain error: {e}")
+                            break
 
                 next_send_time += 0.020
                 now = time.monotonic()
@@ -519,12 +524,13 @@ class AsteriskVoiceSession:
             packet = bytes([0x10]) + len(chunk).to_bytes(2, "big") + chunk
             async with self._writer_lock:
                 self.writer.write(packet)
-                try:
-                    await self.writer.drain()
-                except Exception as e:
-                    write_errors += 1
-                    logger.error(f'[AudioSocket] Drain error at chunk {chunk_num}: {e}')
-                    break
+                if chunk_num % 10 == 0 or chunk_num == total_chunks - 1:
+                    try:
+                        await self.writer.drain()
+                    except Exception as e:
+                        write_errors += 1
+                        logger.error(f'[AudioSocket] Drain error at chunk {chunk_num}: {e}')
+                        break
             
             chunk_num += 1
             if logger.isEnabledFor(logging.DEBUG):
@@ -927,11 +933,12 @@ class AsteriskVoiceSession:
                         packet = bytes([0x10]) + len(chunk).to_bytes(2, 'big') + chunk
                         async with self._writer_lock:
                             self.writer.write(packet)
-                            try:
-                                await self.writer.drain()
-                            except Exception as e:
-                                logger.error(f'[AudioSocket] Drain error in flat playback: {e}')
-                                break
+                            if frame_count % 10 == 0 or offset >= pcm_bytes:
+                                try:
+                                    await self.writer.drain()
+                                except Exception as e:
+                                    logger.error(f'[AudioSocket] Drain error in flat playback: {e}')
+                                    break
 
                         next_send_time += 0.02
                         remaining = next_send_time - time.monotonic()

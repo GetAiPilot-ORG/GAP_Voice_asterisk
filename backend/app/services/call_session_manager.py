@@ -18,6 +18,22 @@ class CallSessionManager:
     def _init(self):
         self.active_calls = {}
         self.cleanup_callbacks = {}
+        self.uniqueid_to_call_uuid = {}
+
+    def link_uniqueid(self, asterisk_uniqueid: str, call_uuid: str) -> None:
+        """Map Asterisk channel uniqueid to canonical RFC 4122 call_uuid."""
+        if asterisk_uniqueid and call_uuid:
+            self.uniqueid_to_call_uuid[asterisk_uniqueid] = call_uuid
+
+    def resolve_call_uuid(self, identifier: str) -> Optional[str]:
+        """Resolve either a canonical call_uuid or an Asterisk channel uniqueid to the call_uuid."""
+        if not identifier:
+            return None
+        if identifier in self.active_calls:
+            return identifier
+        if identifier in self.uniqueid_to_call_uuid:
+            return self.uniqueid_to_call_uuid[identifier]
+        return identifier
 
     def register_inbound_asterisk_call(
         self,
@@ -27,10 +43,12 @@ class CallSessionManager:
         workspace_id: str,
         agent_id: str,
         phone_number_id: str,
+        asterisk_uniqueid: Optional[str] = None,
     ) -> Dict[str, Any]:
-        logger.info(f"[CallSessionManager] Registering inbound call {call_uuid} for agent {agent_id}")
+        logger.info(f"[CallSessionManager] Registering inbound call {call_uuid} (uniqueid={asterisk_uniqueid}) for agent {agent_id}")
         context = {
             "call_uuid": call_uuid,
+            "asterisk_uniqueid": asterisk_uniqueid,
             "caller_id": caller_id,
             "dialed_number": dialed_number,
             "workspace_id": workspace_id,
@@ -46,25 +64,33 @@ class CallSessionManager:
             "cost_cents": 0
         }
         self.active_calls[call_uuid] = context
+        if asterisk_uniqueid:
+            self.uniqueid_to_call_uuid[asterisk_uniqueid] = call_uuid
         return context
 
-    async def get_call_context(self, call_uuid: str) -> Optional[Dict[str, Any]]:
+    async def get_call_context(self, identifier: str) -> Optional[Dict[str, Any]]:
+        call_uuid = self.resolve_call_uuid(identifier) or identifier
         context = self.active_calls.get(call_uuid)
         if not context:
             try:
                 db = get_supabase_client()
                 def _query():
-                    return db.table("calls").select("*").eq("call_uuid", call_uuid).execute()
+                    # Query by call_uuid primary key or metadata asterisk_uniqueid
+                    res = db.table("calls").select("*").eq("call_uuid", call_uuid).execute()
+                    if not res.data:
+                        res = db.table("calls").select("*").eq("id", call_uuid).execute()
+                    return res
                 res = await asyncio.to_thread(_query)
                 if res.data:
                     row = res.data[0]
                     context = self.register_inbound_asterisk_call(
-                        call_uuid=call_uuid,
+                        call_uuid=row.get("call_uuid") or row.get("id"),
                         caller_id=row.get("caller_id") or row.get("caller_phone_number") or "",
                         dialed_number=row.get("dialed_number") or "",
                         workspace_id=row.get("workspace_id"),
                         agent_id=row.get("agent_id"),
                         phone_number_id=row.get("phone_number_id"),
+                        asterisk_uniqueid=row.get("metadata", {}).get("asterisk_uniqueid") if isinstance(row.get("metadata"), dict) else None
                     )
                     context["status"] = row.get("status")
             except Exception as e:
@@ -115,7 +141,8 @@ class CallSessionManager:
             return context
         return None
 
-    def start_audio_session(self, call_uuid: str) -> bool:
+    def start_audio_session(self, identifier: str) -> bool:
+        call_uuid = self.resolve_call_uuid(identifier) or identifier
         context = self.active_calls.get(call_uuid)
         if not context:
             return False
@@ -133,10 +160,16 @@ class CallSessionManager:
             except Exception as e:
                 logger.error(f"[CallSessionManager] DB status update error for {call_uuid}: {e}")
 
-        asyncio.create_task(asyncio.to_thread(_update))
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(asyncio.to_thread(_update))
+        except RuntimeError:
+            import threading
+            threading.Thread(target=_update, daemon=True).start()
         return True
 
-    def end_call(self, call_uuid: str, reason: str = "hangup") -> bool:
+    def end_call(self, identifier: str, reason: str = "hangup") -> bool:
+        call_uuid = self.resolve_call_uuid(identifier) or identifier
         context = self.active_calls.get(call_uuid)
         if not context:
             # Still attempt to release from Redis even if context was cleaned up
@@ -146,6 +179,11 @@ class CallSessionManager:
             except Exception:
                 pass
             return False
+
+        # Idempotency check: avoid duplicate finalization, billing calculation, or counter updates
+        if context.get("status") == "completed":
+            logger.info(f"[CallSessionManager] Call {call_uuid} is already finalized (status=completed). Skipping duplicate end_call.")
+            return True
 
         # Release Redis slot
         try:
@@ -261,7 +299,12 @@ class CallSessionManager:
             except Exception as e:
                 logger.error(f"[CallSessionManager] DB update error on end_call {call_uuid}: {e}")
 
-        asyncio.create_task(asyncio.to_thread(_update))
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(asyncio.to_thread(_update))
+        except RuntimeError:
+            import threading
+            threading.Thread(target=_update, daemon=True).start()
         return True
 
     def register_cleanup_callback(self, call_uuid: str, callback: Callable[[str], None]) -> None:

@@ -712,6 +712,7 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
     caller_id = params.get("caller_id") or params.get("caller") or ""
     dialed_number = params.get("dialed_number") or params.get("dialed") or ""
     call_uuid = params.get("call_uuid") or params.get("uuid") or ""
+    asterisk_uniqueid = params.get("asterisk_uniqueid") or params.get("uniqueid") or ""
     provider = params.get("provider") or settings.asterisk_provider_name or "asterisk"
     
     # 2. Explicit internal secret validation (query param, header, or localhost trust)
@@ -726,18 +727,24 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
             logger.warning(f"[Asterisk Webhook] Unauthorized secret attempt from {client_host}")
             return Response(content="REJECT:unauthorized", media_type="text/plain")
 
-    # 3. Canonical UUID validation/generation (guarantees RFC4122 compliance for DB and AudioSocket)
+    # 3. Separate Asterisk Channel UniqueID vs RFC 4122 AudioSocket Call UUID
     import uuid
+    canonical_uuid = None
     try:
         if call_uuid and len(call_uuid.strip()) > 0:
-            call_uuid = str(uuid.UUID(str(call_uuid).strip()))
-        else:
-            call_uuid = str(uuid.uuid4())
+            canonical_uuid = str(uuid.UUID(str(call_uuid).strip()))
     except Exception:
-        # Supplied call_uuid was not RFC4122 format (e.g. Asterisk UNIQUEID '1700000000.123')
-        call_uuid = str(uuid.uuid4())
+        # call_uuid passed was not a valid RFC4122 UUID (e.g. was an Asterisk UNIQUEID like 1794915238.201)
+        if not asterisk_uniqueid and call_uuid:
+            asterisk_uniqueid = call_uuid
+        canonical_uuid = None
+
+    if not canonical_uuid:
+        canonical_uuid = str(uuid.uuid4())
+
+    call_uuid = canonical_uuid
     
-    logger.info(f"[Asterisk Webhook] Inbound call trigger: caller={mask_phone_number(caller_id)}, DID={mask_phone_number(dialed_number)}, uuid={call_uuid}")
+    logger.info(f"[Asterisk Webhook] Inbound call trigger: caller={mask_phone_number(caller_id)}, DID={mask_phone_number(dialed_number)}, uuid={call_uuid}, uniqueid={asterisk_uniqueid}")
 
     # 4. Normalize dialed number and generate all Indian telecom variants (0-prefix, 91-prefix, +91, local 10-digit)
     search_variants = set()
@@ -861,7 +868,11 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
             "direction": "inbound",
             "status": "ringing",
             "started_at": datetime.now(timezone.utc).isoformat(),
-            "metadata": {"provider": provider, "dialed_number": dialed_number}
+            "metadata": {
+                "provider": provider,
+                "dialed_number": dialed_number,
+                "asterisk_uniqueid": asterisk_uniqueid
+            }
         }
         if is_did:
             insert_payload["did_number_id"] = phone_id
@@ -882,7 +893,7 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
     except Exception as db_exc:
         logger.error(f"[Asterisk Webhook] Failed to insert call record in DB: {db_exc}")
 
-    # 7. Store call_uuid mapping in CallSessionManager
+    # 7. Store call_uuid and uniqueid mapping in CallSessionManager
     from app.services.call_session_manager import call_session_manager
     call_session_manager.register_inbound_asterisk_call(
         call_uuid=call_uuid,
@@ -890,10 +901,11 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
         dialed_number=dialed_number,
         workspace_id=str(workspace_id),
         agent_id=str(agent_id),
-        phone_number_id=str(phone_id)
+        phone_number_id=str(phone_id),
+        asterisk_uniqueid=asterisk_uniqueid
     )
 
-    logger.info(f"[Asterisk Webhook] Inbound call ALLOWED and registered for UUID {call_uuid}")
+    logger.info(f"[Asterisk Webhook] Inbound call ALLOWED and registered: UUID={call_uuid}, UniqueID={asterisk_uniqueid}")
     return Response(content=f"ALLOW:{call_uuid}", media_type="text/plain")
 
 
@@ -972,7 +984,8 @@ async def asterisk_hangup(request: Request, db: Client = Depends(get_db)):
         if k not in params:
             params[k] = v
 
-    call_uuid = params.get("call_uuid") or params.get("uuid") or ""
+    raw_uuid = params.get("call_uuid") or params.get("uuid") or ""
+    asterisk_uniqueid = params.get("asterisk_uniqueid") or params.get("uniqueid") or ""
     cause_code = str(params.get("cause") or "").strip()
     duration_str = params.get("duration") or "0"
 
@@ -981,10 +994,13 @@ async def asterisk_hangup(request: Request, db: Client = Depends(get_db)):
     except ValueError:
         duration_sec = 0
 
+    from app.services.call_session_manager import call_session_manager
+    call_uuid = call_session_manager.resolve_call_uuid(raw_uuid) or call_session_manager.resolve_call_uuid(asterisk_uniqueid) or raw_uuid
+
     if not call_uuid:
         return Response(content="ERROR:missing_call_uuid", media_type="text/plain")
 
-    logger.info(f"[Asterisk Webhook] Hangup reported for {call_uuid}: cause={cause_code}, duration={duration_sec}s")
+    logger.info(f"[Asterisk Webhook] Hangup reported for {call_uuid} (uniqueid={asterisk_uniqueid}): cause={cause_code}, duration={duration_sec}s")
 
     # Map Q.850 causes
     # 16: NORMAL_CLEARING, 17: USER_BUSY, 18/19: NO_ANSWER, 21: CALL_REJECTED

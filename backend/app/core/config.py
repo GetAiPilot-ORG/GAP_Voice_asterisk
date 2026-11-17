@@ -45,10 +45,10 @@ class Settings(BaseSettings):
     # Asterisk AudioSocket
     asterisk_audiosocket_enabled: bool = True
     asterisk_audiosocket_host: str = "127.0.0.1"
-    asterisk_audiosocket_port: int = 9092
-    asterisk_webhook_secret: Optional[str] = None
+    asterisk_audiosocket_port: int = 9095
+    asterisk_webhook_secret: Optional[str] = "your_shared_secret"
     api_host: str = "0.0.0.0"
-    api_port: int = 8000
+    api_port: int = 8010
     api_workers: int = 4
     
     # App
@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     PUNCTUATION_RESTORE: bool = False
     FIRST_CHUNK_TIMEOUT_MS: int = 0
     NEXT_CHUNK_TIMEOUT_MS: int = 1200
-    DISABLE_STREAMING_TTS: bool = True
+    DISABLE_STREAMING_TTS: bool = False  # Set to True for full-response fallback
     TTS_PREBUFFER_MS: int = 1500
     MIN_AUDIO_CHUNKS_BEFORE_PLAYBACK: int = 2
 

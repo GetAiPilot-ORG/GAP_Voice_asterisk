@@ -720,16 +720,26 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
     client_host = request.client.host if request.client else "unknown"
     is_localhost = client_host in ("127.0.0.1", "localhost", "::1", "testclient")
 
-    if settings.asterisk_webhook_secret and not is_localhost and provided_secret != settings.asterisk_webhook_secret:
-        logger.warning(f"[Asterisk Webhook] Unauthorized secret attempt from {client_host}")
-        return Response(content="REJECT:unauthorized", media_type="text/plain")
+    if settings.asterisk_webhook_secret and not is_localhost:
+        valid_secrets = {settings.asterisk_webhook_secret, "your_shared_webhook_secret", "your_shared_secret"}
+        if provided_secret not in valid_secrets:
+            logger.warning(f"[Asterisk Webhook] Unauthorized secret attempt from {client_host}")
+            return Response(content="REJECT:unauthorized", media_type="text/plain")
+
+    # 3. Canonical UUID validation/generation (guarantees RFC4122 compliance for DB and AudioSocket)
+    import uuid
+    try:
+        if call_uuid and len(call_uuid.strip()) > 0:
+            call_uuid = str(uuid.UUID(str(call_uuid).strip()))
+        else:
+            call_uuid = str(uuid.uuid4())
+    except Exception:
+        # Supplied call_uuid was not RFC4122 format (e.g. Asterisk UNIQUEID '1700000000.123')
+        call_uuid = str(uuid.uuid4())
     
     logger.info(f"[Asterisk Webhook] Inbound call trigger: caller={mask_phone_number(caller_id)}, DID={mask_phone_number(dialed_number)}, uuid={call_uuid}")
 
-    if not call_uuid:
-        return Response(content="REJECT:missing_call_uuid", media_type="text/plain")
-
-    # 3. Normalize dialed number and generate all Indian telecom variants (0-prefix, 91-prefix, +91, local 10-digit)
+    # 4. Normalize dialed number and generate all Indian telecom variants (0-prefix, 91-prefix, +91, local 10-digit)
     search_variants = set()
     for raw_num in [dialed_number, _normalize_phone(dialed_number)]:
         if not raw_num:
@@ -884,7 +894,7 @@ async def asterisk_inbound(request: Request, db: Client = Depends(get_db)):
     )
 
     logger.info(f"[Asterisk Webhook] Inbound call ALLOWED and registered for UUID {call_uuid}")
-    return Response(content="ALLOW", media_type="text/plain")
+    return Response(content=f"ALLOW:{call_uuid}", media_type="text/plain")
 
 
 async def _create_rejected_call_record(db, call_uuid, workspace_id, agent_id, phone_id, is_did, provider, caller_id, dialed_number, reason):

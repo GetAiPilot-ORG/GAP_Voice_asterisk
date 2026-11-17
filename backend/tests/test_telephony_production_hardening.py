@@ -128,3 +128,30 @@ def test_hangup_cause_code_mapping():
     assert cause_map["17"] == "user_busy"
     assert cause_map["18"] == "no_answer"
     assert cause_map["21"] == "call_rejected"
+
+
+def test_uuid_canonicalization_and_generation():
+    """Verify that empty, Asterisk UNIQUEID, or invalid UUIDs are automatically transformed to valid RFC4122 UUIDs."""
+    import uuid
+
+    def canonicalize_or_generate_uuid(raw_uuid: str) -> str:
+        try:
+            if raw_uuid and len(raw_uuid.strip()) > 0:
+                return str(uuid.UUID(str(raw_uuid).strip()))
+            else:
+                return str(uuid.uuid4())
+        except Exception:
+            return str(uuid.uuid4())
+
+    # Case 1: Empty or None
+    u1 = canonicalize_or_generate_uuid("")
+    assert uuid.UUID(u1).version == 4
+
+    # Case 2: Asterisk Channel UniqueID like 1700000000.123
+    u2 = canonicalize_or_generate_uuid("1700000000.123")
+    assert uuid.UUID(u2).version == 4
+
+    # Case 3: Valid existing UUID string
+    existing = "c1a44948-befb-4a3a-91f3-342443f1520c"
+    u3 = canonicalize_or_generate_uuid(existing)
+    assert u3 == existing

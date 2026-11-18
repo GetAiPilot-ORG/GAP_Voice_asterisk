@@ -211,16 +211,11 @@ def run_voice_call(task_id: str, payload: Dict[str, Any], attempt: int = 1):
             except Exception:
                 provider_type = "custom"
 
-            if provider_type != "twilio":
-                if dial_number.startswith('+'):
-                    if dial_number.startswith('+91'):
-                        dial_number = dial_number[1:]
-
-            if not dial_number.startswith('+'):
-                dial_number = '+' + dial_number
+            from app.api.v1.calls import format_pstn_dial_number
+            dial_number = format_pstn_dial_number(dial_number, provider_type)
 
             endpoint_name = f"provider-{trunk_id}"
-            caller_id = from_number or "+18166536732"
+            caller_id = from_number or "911168140253"
 
             # Prepare originate command execution functions
             from app.api.v1.calls import execute_asterisk_cli, is_audiosocket_listening

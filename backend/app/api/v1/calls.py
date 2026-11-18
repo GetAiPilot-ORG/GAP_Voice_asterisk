@@ -20,6 +20,32 @@ def execute_asterisk_cli(asterisk_cmd: str) -> Dict[str, Any]:
     return execute_asterisk_cli_cmd(asterisk_cmd)
 
 
+def format_pstn_dial_number(dial_number: str, provider_type: str = "custom") -> str:
+    """
+    Normalizes dial numbers according to telecom provider rules.
+    Indian SIP Trunks (24IT Hub / ConnexCS / Tata / Airtel) require national STD format: 0XXXXXXXXXX.
+    """
+    dial_number = dial_number.strip()
+    if provider_type == "twilio":
+        if not dial_number.startswith("+"):
+            return "+" + dial_number
+        return dial_number
+
+    clean_digits = re.sub(r"\D", "", dial_number)
+    if clean_digits.startswith("91") and len(clean_digits) == 12:
+        # Indian 10-digit mobile with 91 country code -> convert to 0 + 10 digits
+        return "0" + clean_digits[2:]
+    elif len(clean_digits) == 10:
+        # 10-digit Indian mobile -> prepend 0
+        return "0" + clean_digits
+    elif clean_digits.startswith("0") and len(clean_digits) == 11:
+        # Already formatted with STD 0 prefix
+        return clean_digits
+    elif dial_number.startswith("+"):
+        return dial_number[1:]
+    return dial_number
+
+
 def is_audiosocket_listening() -> bool:
     """Checks if a TCP listener is active on AudioSocket port."""
     import socket
@@ -412,13 +438,7 @@ async def test_call(
         except Exception:
             provider_type = "custom"
             
-        if provider_type != "twilio":
-            # 24IThub and Indian SIP trunks require 91XXXXXXXXXX without '+' prefix
-            if dial_number.startswith('+'):
-                dial_number = dial_number[1:]
-        else:
-            if not dial_number.startswith('+'):
-                dial_number = '+' + dial_number
+        dial_number = format_pstn_dial_number(dial_number, provider_type)
                 
         endpoint_name = f"provider-{trunk_id}"
         caller_id = from_number or "911168140253"
@@ -915,13 +935,7 @@ async def asterisk_outbound_call(body: Dict[str, Any], db: Client = Depends(get_
     except Exception:
         provider_type = "custom"
         
-    if provider_type != "twilio":
-        # 24IThub and Indian SIP trunks require 91XXXXXXXXXX without '+' prefix
-        if dial_number.startswith('+'):
-            dial_number = dial_number[1:]
-    else:
-        if not dial_number.startswith('+'):
-            dial_number = '+' + dial_number
+    dial_number = format_pstn_dial_number(dial_number, provider_type)
             
     endpoint_name = f"provider-{trunk_id}"
     caller_id = from_number or "911168140253"

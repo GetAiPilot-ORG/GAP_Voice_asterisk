@@ -616,9 +616,8 @@ class AsteriskVoiceSession:
         first_byte_yielded = False
         bytes_yielded = 0
 
-        conn = await self._get_tts_conn(routed_provider)
-
         try:
+            conn = await self._get_tts_conn(routed_provider)
             async for chunk in conn.speak(text):
                 if not chunk:
                     continue
@@ -638,6 +637,29 @@ class AsteriskVoiceSession:
 
                 bytes_yielded += len(chunk)
                 yield chunk
+        except Exception as e:
+            logger.warning(f'[TTS Stream] Provider {routed_provider} failed ({e}), attempting fallback to Deepgram')
+            if routed_provider != 'deepgram':
+                try:
+                    dg_conn = await self._get_tts_conn('deepgram')
+                    async for chunk in dg_conn.speak(text):
+                        if not chunk:
+                            continue
+                        if chunk.startswith(b'RIFF') and b'WAVE' in chunk[:16]:
+                            data_idx = chunk.find(b'data')
+                            chunk = chunk[data_idx + 8:] if data_idx != -1 else chunk[44:]
+                            if not chunk:
+                                continue
+                        if not first_byte_yielded:
+                            first_byte_yielded = True
+                            self.tts_first_byte_time = time.time()
+                        bytes_yielded += len(chunk)
+                        yield chunk
+                except Exception as dg_err:
+                    logger.error(f'[TTS Stream] Deepgram fallback also failed: {dg_err}')
+                    raise
+            else:
+                raise
 
             duration_ms = int((time.time() - start_t) * 1000)
             logger.info(f'[TTS Stream] Chunk #{idx} completed in {duration_ms}ms (yielded {bytes_yielded} bytes)')
@@ -674,45 +696,45 @@ class AsteriskVoiceSession:
             )
             logger.info(f'[TTS] chunk #{chunk_idx} provider={routed_provider}')
 
+            pcm_8k = b''
             if routed_provider == 'sarvam':
-                conn = await self._get_tts_conn('sarvam')
+                try:
+                    conn = await self._get_tts_conn('sarvam')
+                    logger.info(f'[TTS] Sarvam speak() -> "{text[:80]}"')
+                    raw_chunks: list[bytes] = []
+                    async for audio_chunk in conn.speak(text):
+                        if audio_chunk:
+                            raw_chunks.append(audio_chunk)
 
-                logger.info(f'[TTS] Sarvam speak() -> "{text[:80]}"')
-                raw_chunks: list[bytes] = []
-                async for audio_chunk in conn.speak(text):
-                    if audio_chunk:
-                        raw_chunks.append(audio_chunk)
+                    if raw_chunks:
+                        pcm_8k = b''.join(raw_chunks)
+                        # Strip WAV header if Sarvam returned WAV instead of raw PCM
+                        if pcm_8k.startswith(b'RIFF') and b'WAVE' in pcm_8k[:16]:
+                            logger.info('[TTS] Sarvam returned WAV - stripping RIFF header')
+                            data_idx = pcm_8k.find(b'data')
+                            pcm_8k = pcm_8k[data_idx + 8:] if data_idx != -1 else pcm_8k[44:]
+                        logger.info(f'[TTS] Sarvam raw 8kHz: bytes={len(pcm_8k)}')
+                    else:
+                        logger.warning(f'[TTS] Sarvam returned zero bytes for chunk #{chunk_idx}, falling back to Deepgram')
+                except Exception as sarvam_err:
+                    logger.warning(f'[TTS] Sarvam synthesis failed ({sarvam_err}), falling back to Deepgram TTS')
+                    pcm_8k = b''
 
-                if not raw_chunks:
-                    logger.warning(f'[TTS] Sarvam returned zero bytes for chunk #{chunk_idx}')
-                    return b''
-
-                pcm_8k = b''.join(raw_chunks)
-                logger.info(
-                    f'[TTS] Sarvam raw 8kHz: bytes={len(pcm_8k)}, '
-                    f'first32={pcm_8k[:32].hex()}'
-                )
-
-                # Strip WAV header if Sarvam returned WAV instead of raw PCM
-                if pcm_8k.startswith(b'RIFF') and b'WAVE' in pcm_8k[:16]:
-                    logger.info('[TTS] Sarvam returned WAV - stripping RIFF header')
-                    data_idx = pcm_8k.find(b'data')
-                    pcm_8k = pcm_8k[data_idx + 8:] if data_idx != -1 else pcm_8k[44:]
-
-                # No resampling needed: Sarvam returned 8kHz PCM directly
-
-            else:
+            if not pcm_8k:
                 # Deepgram streams 8kHz 16-bit linear PCM directly
-                conn = await self._get_tts_conn('deepgram')
+                try:
+                    conn = await self._get_tts_conn('deepgram')
+                    logger.info(f'[TTS] Deepgram speak() -> "{text[:80]}"')
+                    dg_chunks: list[bytes] = []
+                    async for audio_chunk in conn.speak(text):
+                        if audio_chunk:
+                            dg_chunks.append(audio_chunk)
 
-                logger.info(f'[TTS] Deepgram speak() -> "{text[:80]}"')
-                dg_chunks: list[bytes] = []
-                async for audio_chunk in conn.speak(text):
-                    if audio_chunk:
-                        dg_chunks.append(audio_chunk)
-
-                pcm_8k = b''.join(dg_chunks)
-                logger.info(f'[TTS] Deepgram raw: bytes={len(pcm_8k)}, first32={pcm_8k[:32].hex()}')
+                    pcm_8k = b''.join(dg_chunks)
+                    logger.info(f'[TTS] Deepgram raw: bytes={len(pcm_8k)}')
+                except Exception as dg_err:
+                    logger.error(f'[TTS] Deepgram fallback failed: {dg_err}')
+                    return b''
 
             ms = int((time.time() - start) * 1000)
             logger.info(
@@ -1422,16 +1444,30 @@ class AsteriskVoiceSession:
                     continue
 
                 elif event_type in (EVT_INTERIM, EVT_FINAL, EVT_SPEECH_FINAL):
-                    if self.greeting_active:
-                        continue
-
                     transcript = payload.get('transcript', '').strip()
                     clean_text = re.sub(r'[^\w\s\u0900-\u097F]', '', transcript).strip() if transcript else ""
+                    if not clean_text:
+                        continue
+
+                    logger.info(f"[STT] Event {event_type}: '{transcript}' (speaking={self.is_speaking()}, greeting_active={self.greeting_active})")
 
                     # 1. BARGE-IN (When bot is actively speaking)
                     if self.is_speaking():
                         if not clean_text:
                             continue
+
+                        # Guard initial greeting against early line connect clicks and noise in first 1.5s
+                        if getattr(self, "greeting_protected", False):
+                            elapsed_speaking = time.time() - self.speaking_started_at
+                            if elapsed_speaking < 1.5:
+                                logger.debug(
+                                    f'[Barge-In] Greeting protected (elapsed={elapsed_speaking:.2f}s), '
+                                    f'suppressing early line audio: "{transcript}"'
+                                )
+                                continue
+                            else:
+                                self.greeting_protected = False
+
                         words = clean_text.split()
 
                         # A. Backchannel check: if caller is merely acknowledging, do not interrupt
@@ -1571,8 +1607,12 @@ class AsteriskVoiceSession:
                             self.stt_task = asyncio.create_task(self.stt_loop())
                         try:
                             self.audio_queue.put_nowait(payload)
-                            # Update diagnostics once per second (every 50 packets) to reduce event-loop overhead
                             self._packet_count = getattr(self, '_packet_count', 0) + 1
+                            if self._packet_count == 1:
+                                logger.info(f'[AudioSocket] First audio frame received from Asterisk: {len(payload)} bytes, rms={self.last_audio_energy:.0f}')
+                            elif self._packet_count % 100 == 0:
+                                logger.info(f'[AudioSocket] Audio flowing: {self._packet_count} packets received from Asterisk, rms={self.last_audio_energy:.0f}')
+                            # Update diagnostics once per second (every 50 packets) to reduce event-loop overhead
                             if self._packet_count % 50 == 0:
                                 diagnostics.update_session_state(
                                     self.call_uuid,

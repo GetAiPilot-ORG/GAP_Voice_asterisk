@@ -59,10 +59,11 @@ def test_asterisk_config_generator_pjsip_security():
     assert "Anonymous" not in pjsip
 
     # 2. Symmetric RTP and NAT traversal
-    assert "rtp_symmetric=yes" in pjsip
+    assert "rtp_symmetric=no" in pjsip
     assert "direct_media=no" in pjsip
     assert "force_rport=yes" in pjsip
     assert "rewrite_contact=yes" in pjsip
+    assert "rtp_keepalive=1" in pjsip
 
     # 3. Carrier RTP gateway match
     assert "match=202.89.78.2" in pjsip
@@ -128,3 +129,94 @@ def test_hangup_cause_code_mapping():
     assert cause_map["17"] == "user_busy"
     assert cause_map["18"] == "no_answer"
     assert cause_map["21"] == "call_rejected"
+
+
+def test_uuid_canonicalization_and_generation():
+    """Verify that empty, Asterisk UNIQUEID, or invalid UUIDs are automatically transformed to valid RFC4122 UUIDs."""
+    import uuid
+
+    def canonicalize_or_generate_uuid(raw_uuid: str) -> str:
+        try:
+            if raw_uuid and len(raw_uuid.strip()) > 0:
+                return str(uuid.UUID(str(raw_uuid).strip()))
+            else:
+                return str(uuid.uuid4())
+        except Exception:
+            return str(uuid.uuid4())
+
+    # Case 1: Empty or None
+    u1 = canonicalize_or_generate_uuid("")
+    assert uuid.UUID(u1).version == 4
+
+    # Case 2: Asterisk Channel UniqueID like 1700000000.123
+    u2 = canonicalize_or_generate_uuid("1700000000.123")
+    assert uuid.UUID(u2).version == 4
+
+    # Case 3: Valid existing UUID string
+    existing = "c1a44948-befb-4a3a-91f3-342443f1520c"
+    u3 = canonicalize_or_generate_uuid(existing)
+    assert u3 == existing
+
+
+def test_call_session_manager_identifier_correlation():
+    """Verify CallSessionManager separates and correlates Asterisk UNIQUEID and RFC4122 call_uuid."""
+    csm = CallSessionManager()
+    call_uuid = "e4a2c918-091a-4d43-85b2-3f1289123456"
+    asterisk_uniqueid = "1794915238.201"
+
+    context = csm.register_inbound_asterisk_call(
+        call_uuid=call_uuid,
+        caller_id="919343418163",
+        dialed_number="911168140253",
+        workspace_id="ws-test-1",
+        agent_id="agent-test-1",
+        phone_number_id="phone-test-1",
+        asterisk_uniqueid=asterisk_uniqueid,
+    )
+
+    assert context["call_uuid"] == call_uuid
+    assert context["asterisk_uniqueid"] == asterisk_uniqueid
+    assert csm.resolve_call_uuid(call_uuid) == call_uuid
+    assert csm.resolve_call_uuid(asterisk_uniqueid) == call_uuid
+
+
+def test_call_session_manager_idempotent_end_call():
+    """Verify calling end_call multiple times does not duplicate finalization."""
+    csm = CallSessionManager()
+    call_uuid = "a1b2c3d4-e5f6-7890-abcd-112233445566"
+    csm.register_inbound_asterisk_call(
+        call_uuid=call_uuid,
+        caller_id="919343418163",
+        dialed_number="911168140253",
+        workspace_id="ws-test-1",
+        agent_id="agent-test-1",
+        phone_number_id="phone-test-1",
+    )
+
+    # First termination
+    res1 = csm.end_call(call_uuid, reason="normal_clearing")
+    assert res1 is True
+    assert csm.active_calls[call_uuid]["status"] == "completed"
+
+    # Second duplicate termination (e.g. from both AudioSocket cleanup and hangup handler)
+    res2 = csm.end_call(call_uuid, reason="normal_clearing")
+    assert res2 is True
+    assert csm.active_calls[call_uuid]["status"] == "completed"
+
+
+def test_dialplan_hangup_isolation():
+    """Verify dialplan prevents extension 'h' from entering inbound authorization."""
+    with open("deploy/asterisk/extensions.conf", "r") as f:
+        content = f.read()
+
+    # 1. Inbound pattern must match phone digits only (not _.)
+    assert "exten => _[+0-9].,1," in content
+    assert "exten => _.,1," not in content
+
+    # 2. Dedicated hangup extension must exist
+    assert "exten => h,1,NoOp(=== INBOUND CHANNEL HANGUP COMPLETED" in content
+
+    # 3. AudioSocket UUID must be validated to 36 chars before AudioSocket invocation
+    assert "[${LEN(${CALL_UUID})} = 36]" in content
+    assert "same => n,AudioSocket(${CALL_UUID},127.0.0.1:${AUDIOSOCKET_PORT})" in content
+

@@ -1455,6 +1455,19 @@ class AsteriskVoiceSession:
                     if self.is_speaking():
                         if not clean_text:
                             continue
+
+                        # Guard initial greeting against early line connect clicks and noise in first 1.5s
+                        if getattr(self, "greeting_protected", False):
+                            elapsed_speaking = time.time() - self.speaking_started_at
+                            if elapsed_speaking < 1.5:
+                                logger.debug(
+                                    f'[Barge-In] Greeting protected (elapsed={elapsed_speaking:.2f}s), '
+                                    f'suppressing early line audio: "{transcript}"'
+                                )
+                                continue
+                            else:
+                                self.greeting_protected = False
+
                         words = clean_text.split()
 
                         # A. Backchannel check: if caller is merely acknowledging, do not interrupt

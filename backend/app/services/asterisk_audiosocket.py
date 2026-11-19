@@ -1444,11 +1444,12 @@ class AsteriskVoiceSession:
                     continue
 
                 elif event_type in (EVT_INTERIM, EVT_FINAL, EVT_SPEECH_FINAL):
-                    if self.greeting_active:
-                        continue
-
                     transcript = payload.get('transcript', '').strip()
                     clean_text = re.sub(r'[^\w\s\u0900-\u097F]', '', transcript).strip() if transcript else ""
+                    if not clean_text:
+                        continue
+
+                    logger.info(f"[STT] Event {event_type}: '{transcript}' (speaking={self.is_speaking()}, greeting_active={self.greeting_active})")
 
                     # 1. BARGE-IN (When bot is actively speaking)
                     if self.is_speaking():
@@ -1593,8 +1594,12 @@ class AsteriskVoiceSession:
                             self.stt_task = asyncio.create_task(self.stt_loop())
                         try:
                             self.audio_queue.put_nowait(payload)
-                            # Update diagnostics once per second (every 50 packets) to reduce event-loop overhead
                             self._packet_count = getattr(self, '_packet_count', 0) + 1
+                            if self._packet_count == 1:
+                                logger.info(f'[AudioSocket] First audio frame received from Asterisk: {len(payload)} bytes, rms={self.last_audio_energy:.0f}')
+                            elif self._packet_count % 100 == 0:
+                                logger.info(f'[AudioSocket] Audio flowing: {self._packet_count} packets received from Asterisk, rms={self.last_audio_energy:.0f}')
+                            # Update diagnostics once per second (every 50 packets) to reduce event-loop overhead
                             if self._packet_count % 50 == 0:
                                 diagnostics.update_session_state(
                                     self.call_uuid,

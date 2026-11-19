@@ -44,8 +44,9 @@ class CallSessionManager:
         agent_id: str,
         phone_number_id: str,
         asterisk_uniqueid: Optional[str] = None,
+        direction: str = "inbound",
     ) -> Dict[str, Any]:
-        logger.info(f"[CallSessionManager] Registering inbound call {call_uuid} (uniqueid={asterisk_uniqueid}) for agent {agent_id}")
+        logger.info(f"[CallSessionManager] Registering call {call_uuid} (direction={direction}, uniqueid={asterisk_uniqueid}) for agent {agent_id}")
         context = {
             "call_uuid": call_uuid,
             "asterisk_uniqueid": asterisk_uniqueid,
@@ -55,7 +56,7 @@ class CallSessionManager:
             "agent_id": agent_id,
             "phone_number_id": phone_number_id,
             "provider": "asterisk",
-            "direction": "inbound",
+            "direction": direction,
             "status": "created",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "started_at": None,
@@ -89,8 +90,9 @@ class CallSessionManager:
                         dialed_number=row.get("dialed_number") or "",
                         workspace_id=row.get("workspace_id"),
                         agent_id=row.get("agent_id"),
-                        phone_number_id=row.get("phone_number_id"),
-                        asterisk_uniqueid=row.get("metadata", {}).get("asterisk_uniqueid") if isinstance(row.get("metadata"), dict) else None
+                        phone_number_id=row.get("did_number_id") or row.get("phone_number_id"),
+                        asterisk_uniqueid=row.get("metadata", {}).get("asterisk_uniqueid") if isinstance(row.get("metadata"), dict) else None,
+                        direction=row.get("direction") or "outbound"
                     )
                     context["status"] = row.get("status")
             except Exception as e:

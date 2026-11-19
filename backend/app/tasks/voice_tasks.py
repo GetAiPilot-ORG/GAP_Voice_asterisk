@@ -174,7 +174,8 @@ def run_voice_call(task_id: str, payload: Dict[str, Any], attempt: int = 1):
                 dialed_number=to_number,
                 workspace_id=str(workspace_id),
                 agent_id=str(agent_id),
-                phone_number_id=str(did_number_id) if did_number_id else ""
+                phone_number_id=str(did_number_id) if did_number_id else "",
+                direction="outbound"
             )
 
             # Insert ringing call record
@@ -269,7 +270,8 @@ def run_voice_call(task_id: str, payload: Dict[str, Any], attempt: int = 1):
                                         dialed_number=to_number,
                                         workspace_id=str(workspace_id),
                                         agent_id=str(agent_id),
-                                        phone_number_id=str(did_number_id) if did_number_id else ""
+                                        phone_number_id=str(did_number_id) if did_number_id else "",
+                                        direction="outbound"
                                     )
                                     try:
                                         db.table("calls").delete().eq("id", call_id).execute()

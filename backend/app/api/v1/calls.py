@@ -398,7 +398,8 @@ async def test_call(
             dialed_number=to_number,
             workspace_id=str(workspace_id),
             agent_id=str(agent_id),
-            phone_number_id=str(did_number_id) if did_number_id else ""
+            phone_number_id=str(did_number_id) if did_number_id else "",
+            direction="outbound"
         )
         
         # Insert call record in DB
@@ -895,7 +896,8 @@ async def asterisk_outbound_call(body: Dict[str, Any], db: Client = Depends(get_
             dialed_number=to_number,
             workspace_id=str(workspace_id),
             agent_id=str(agent_id),
-            phone_number_id=str(phone_id) if phone_id else ""
+            phone_number_id=str(phone_id) if phone_id else "",
+            direction="outbound"
         )
 
         from datetime import datetime, timezone

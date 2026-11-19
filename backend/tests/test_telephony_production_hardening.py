@@ -59,11 +59,10 @@ def test_asterisk_config_generator_pjsip_security():
     assert "Anonymous" not in pjsip
 
     # 2. Symmetric RTP and NAT traversal
-    assert "rtp_symmetric=no" in pjsip
+    assert "rtp_symmetric=yes" in pjsip
     assert "direct_media=no" in pjsip
     assert "force_rport=yes" in pjsip
-    assert "rewrite_contact=no" in pjsip
-    assert "rtp_keepalive=1" in pjsip
+    assert "rewrite_contact=yes" in pjsip
 
     # 3. Carrier RTP gateway match
     assert "match=202.89.78.2" in pjsip

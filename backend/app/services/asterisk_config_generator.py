@@ -41,8 +41,8 @@ class AsteriskConfigGenerator:
         if outbound_caller_id.startswith("+"):
             outbound_caller_id = outbound_caller_id[1:]
 
-        # Force codec safety: allow=ulaw,alaw only
-        codecs_str = "ulaw,alaw"
+        # Force codec safety: allow=alaw,ulaw (alaw first for India/European standard)
+        codecs_str = "alaw,ulaw"
         webhook_secret = settings.asterisk_webhook_secret or "your_shared_webhook_secret"
         transport_name = f"transport-{transport}"
  

@@ -59,7 +59,7 @@ def test_asterisk_config_generator_pjsip_security():
     assert "Anonymous" not in pjsip
 
     # 2. Symmetric RTP and NAT traversal
-    assert "rtp_symmetric=no" in pjsip
+    assert "rtp_symmetric=yes" in pjsip
     assert "direct_media=no" in pjsip
     assert "force_rport=yes" in pjsip
     assert "rewrite_contact=yes" in pjsip
@@ -219,4 +219,36 @@ def test_dialplan_hangup_isolation():
     # 3. AudioSocket UUID must be validated to 36 chars before AudioSocket invocation
     assert "[${LEN(${CALL_UUID})} = 36]" in content
     assert "same => n,AudioSocket(${CALL_UUID},127.0.0.1:${AUDIOSOCKET_PORT})" in content
+
+    # 4. Outbound native audio diagnostic context must exist for TEST B
+    assert "[outbound-test-playback]" in content
+    assert "Playback(hello-world)" in content
+
+
+def test_audiosocket_protocol_framing():
+    """Verify AudioSocket binary framing conforms to 3-byte header specification."""
+    from app.services.asterisk_audiosocket import format_packet, CallMediaDiagnostics
+
+    # 1. Audio packet (0x10) with 320 bytes (20ms @ 8kHz SLIN)
+    payload_320 = b"\x00" * 320
+    packet = format_packet(0x10, payload_320)
+    assert len(packet) == 323
+    assert packet[0] == 0x10
+    # Big-endian 320 is 0x0140
+    assert packet[1:3] == (320).to_bytes(2, "big")
+    assert packet[3:] == payload_320
+
+    # 2. CallMediaDiagnostics tracking
+    diag = CallMediaDiagnostics("test-call-uuid-123")
+    diag.audiosocket_frames_written = 50
+    diag.audiosocket_bytes_written = 16000
+    diag.audiosocket_frames_received = 10
+    diag.socket_close_reason = "normal_hangup"
+    summary = diag.dump_summary()
+    assert summary["call_uuid"] == "test-call-uuid-123"
+    assert summary["frames_written"] == 50
+    assert summary["bytes_written"] == 16000
+    assert summary["frames_received"] == 10
+    assert summary["socket_close_reason"] == "normal_hangup"
+
 

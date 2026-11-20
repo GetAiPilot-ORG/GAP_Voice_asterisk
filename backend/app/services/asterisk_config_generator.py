@@ -41,8 +41,8 @@ class AsteriskConfigGenerator:
         if outbound_caller_id.startswith("+"):
             outbound_caller_id = outbound_caller_id[1:]
 
-        # Force codec safety: allow=alaw only (G.711 A-law is required for Indian PSTN termination)
-        codecs_str = "alaw"
+        # Force codec safety: allow=ulaw,alaw only
+        codecs_str = "ulaw,alaw"
         webhook_secret = settings.asterisk_webhook_secret or "your_shared_webhook_secret"
         transport_name = f"transport-{transport}"
  

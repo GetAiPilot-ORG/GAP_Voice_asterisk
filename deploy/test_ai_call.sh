@@ -42,7 +42,7 @@ echo "------------------------------------------------------"
 if [ -f "/root/asterisk/deploy/asterisk/pjsip.conf" ]; then
     cp /root/asterisk/deploy/asterisk/pjsip.conf /etc/asterisk/pjsip.conf
     asterisk -rx "pjsip reload"
-    echo "  [OK] PJSIP reloaded (allow=alaw enforced)."
+    echo "  [OK] PJSIP reloaded (allow=ulaw,alaw restored for 24IT Hub)."
 fi
 if [ -f "/root/asterisk/deploy/asterisk/extensions.conf" ]; then
     cp /root/asterisk/deploy/asterisk/extensions.conf /etc/asterisk/extensions.conf

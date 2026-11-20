@@ -17,7 +17,7 @@ echo "------------------------------------------------------"
 for logfile in /root/.pm2/logs/asterisk-vp-backend-out.log /root/.pm2/logs/asterisk-vp-backend-error.log /root/asterisk/backend/logs/app.log /var/log/asterisk/messages /var/log/asterisk/full; do
     if [ -f "$logfile" ]; then
         echo ">>> Checking $logfile for $UUID1 and $UUID2..."
-        grep -E "daf1034f|f8babc77" "$logfile" || echo "    (No match in $logfile)"
+        grep -a -E "daf1034f|f8babc77" "$logfile" || echo "    (No match in $logfile)"
     fi
 done
 

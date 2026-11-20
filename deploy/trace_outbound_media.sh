@@ -37,6 +37,19 @@ fi
 echo ""
 echo "[2/6] Syncing PJSIP & Dialplan Configurations:"
 echo "------------------------------------------------------"
+python3 -c "
+import wave, struct, math, os
+os.makedirs('/var/lib/asterisk/sounds', exist_ok=True)
+tone_path = '/var/lib/asterisk/sounds/test-tone.wav'
+with wave.open(tone_path, 'w') as wav:
+    wav.setnchannels(1)
+    wav.setsampwidth(2)
+    wav.setframerate(8000)
+    for i in range(8000 * 6):
+        val = int(18000 * math.sin(2 * math.pi * 440 * i / 8000))
+        wav.writeframes(struct.pack('<h', val))
+print('  [OK] Generated 6s 440Hz test tone at ' + tone_path)
+" 2>/dev/null || true
 if [ -f "/root/asterisk/deploy/asterisk/pjsip.conf" ]; then
     cp /root/asterisk/deploy/asterisk/pjsip.conf /etc/asterisk/pjsip.conf
     asterisk -rx "pjsip reload"

@@ -131,6 +131,8 @@ class CallSessionManager:
                             "language": lang,
                             "voice_id": voice_id,
                             "tts_provider": tts_provider,
+                            "first_message": agent.get("first_message") or agent.get("greeting") or "",
+                            "greeting": agent.get("greeting") or agent.get("first_message") or "",
                             "agent_system_prompt": agent.get("agent_system_prompt") or "",
                             "system_prompt": agent.get("system_prompt") or "",
                             "knowledge_base": agent.get("knowledge_base") or "",

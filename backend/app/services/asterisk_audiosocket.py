@@ -81,6 +81,66 @@ def format_packet(msg_type: int, payload: bytes) -> bytes:
     return header + payload
 
 
+class CallMediaDiagnostics:
+    """Per-call structured diagnostics for telephony AudioSocket media path verification."""
+    def __init__(self, call_uuid: str):
+        self.call_uuid = call_uuid
+        self.t_start = time.monotonic()
+        self.asterisk_uniqueid: Optional[str] = None
+        self.direction: str = "unknown"
+        self.session_found: bool = False
+        self.tenant_resolved: bool = False
+        self.agent_resolved: bool = False
+        self.socket_connected: bool = True
+        self.uuid_packet_received: bool = False
+        self.greeting_triggered: bool = False
+        self.tts_started: bool = False
+        self.tts_completed: bool = False
+        self.tts_output_bytes: int = 0
+        self.pcm_output_bytes: int = 0
+        self.audiosocket_frames_written: int = 0
+        self.audiosocket_bytes_written: int = 0
+        self.audiosocket_frames_received: int = 0
+        self.last_successful_write_time: float = 0.0
+        self.socket_close_reason: str = "in_progress"
+        self.session_cleanup_reason: str = "in_progress"
+
+        # Timings (ms relative to connection start)
+        self.t_greeting_start_ms: Optional[float] = None
+        self.t_first_tts_audio_ms: Optional[float] = None
+        self.t_first_audiosocket_write_ms: Optional[float] = None
+        self.t_first_caller_pcm_ms: Optional[float] = None
+
+    def dump_summary(self) -> dict:
+        duration_s = round(time.monotonic() - self.t_start, 3)
+        return {
+            "call_uuid": self.call_uuid,
+            "asterisk_uniqueid": self.asterisk_uniqueid,
+            "direction": self.direction,
+            "duration_s": duration_s,
+            "session_found": self.session_found,
+            "tenant_resolved": self.tenant_resolved,
+            "agent_resolved": self.agent_resolved,
+            "socket_connected": self.socket_connected,
+            "uuid_packet_received": self.uuid_packet_received,
+            "greeting_triggered": self.greeting_triggered,
+            "tts_started": self.tts_started,
+            "tts_completed": self.tts_completed,
+            "tts_output_bytes": self.tts_output_bytes,
+            "pcm_output_bytes": self.pcm_output_bytes,
+            "frames_written": self.audiosocket_frames_written,
+            "bytes_written": self.audiosocket_bytes_written,
+            "frames_received": self.audiosocket_frames_received,
+            "last_write_ms": round((self.last_successful_write_time - self.t_start) * 1000, 1) if self.last_successful_write_time else None,
+            "timing_greeting_start_ms": round(self.t_greeting_start_ms, 1) if self.t_greeting_start_ms else None,
+            "timing_first_tts_audio_ms": round(self.t_first_tts_audio_ms, 1) if self.t_first_tts_audio_ms else None,
+            "timing_first_write_ms": round(self.t_first_audiosocket_write_ms, 1) if self.t_first_audiosocket_write_ms else None,
+            "timing_first_caller_pcm_ms": round(self.t_first_caller_pcm_ms, 1) if self.t_first_caller_pcm_ms else None,
+            "socket_close_reason": self.socket_close_reason,
+            "session_cleanup_reason": self.session_cleanup_reason
+        }
+
+
 class AsteriskVoiceSession:
     """
     Handles a single active call session over raw TCP AudioSocket.
@@ -153,12 +213,19 @@ class AsteriskVoiceSession:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         call_uuid: str,
-        context: dict
+        context: dict,
+        diag: Optional[CallMediaDiagnostics] = None,
     ) -> None:
         self.reader = reader
         self.writer = writer
         self.call_uuid = call_uuid
         self.context = context
+        self.diag = diag or CallMediaDiagnostics(call_uuid)
+        self.diag.asterisk_uniqueid = context.get('asterisk_uniqueid')
+        self.diag.direction = context.get('direction', 'inbound')
+        self.diag.session_found = bool(context)
+        self.diag.tenant_resolved = bool(context.get('workspace_id'))
+        self.diag.agent_resolved = bool(context.get('agent_id'))
         self.config = context.get('agent_config') or {}
         self.audio_queue = asyncio.Queue(maxsize=400)
         self.messages = []
@@ -377,6 +444,9 @@ class AsteriskVoiceSession:
             return
 
         logger.info(f'[AsteriskVoiceSession] Triggering initial greeting for call {self.call_uuid}')
+        if self.diag:
+            self.diag.greeting_triggered = True
+            self.diag.t_greeting_start_ms = (time.monotonic() - self.diag.t_start) * 1000
         agent_id = self.config.get('agent_id') or self.context.get('agent_id') or 'default'
         voice_id = self.config.get('voice_id') or 'default'
         language = (self.config.get('language') or 'hi-IN').lower()
@@ -427,6 +497,8 @@ class AsteriskVoiceSession:
 
         offset = 0
         total_bytes = len(pcm_8k)
+        if self.diag:
+            self.diag.pcm_output_bytes = total_bytes
         next_send_time = time.monotonic()
         logger.info(f"[Greeting] Playing cached greeting ({total_bytes} bytes, ~{int(total_bytes/16)}ms) for call {self.call_uuid}")
 
@@ -438,16 +510,27 @@ class AsteriskVoiceSession:
                 offset += 320
 
                 if self.writer.is_closing():
+                    if self.diag:
+                        self.diag.socket_close_reason = "writer_closing_during_greeting"
                     break
 
                 packet = bytes([0x10]) + len(chunk).to_bytes(2, "big") + chunk
                 async with self._writer_lock:
                     self.writer.write(packet)
+                    if self.diag:
+                        self.diag.audiosocket_frames_written += 1
+                        self.diag.audiosocket_bytes_written += len(chunk)
+                        self.diag.last_successful_write_time = time.monotonic()
+                        if self.diag.t_first_audiosocket_write_ms is None:
+                            self.diag.t_first_audiosocket_write_ms = (time.monotonic() - self.diag.t_start) * 1000
+
                     if offset % (320 * 10) == 0 or offset >= total_bytes:
                         try:
                             await self.writer.drain()
                         except Exception as e:
                             logger.error(f"[Greeting] Drain error: {e}")
+                            if self.diag:
+                                self.diag.socket_close_reason = f"drain_error_{e}"
                             break
 
                 next_send_time += 0.020
@@ -510,6 +593,9 @@ class AsteriskVoiceSession:
         if not pcm_bytes:
             return
 
+        if self.diag:
+            self.diag.pcm_output_bytes += len(pcm_bytes)
+
         start_time = time.time()
         chunks = chunk_pcm_for_telephony(pcm_bytes, chunk_size=320)
         chunk_num = 0
@@ -520,16 +606,27 @@ class AsteriskVoiceSession:
         for chunk in chunks:
             if self.writer.is_closing():
                 logger.info(f'[AudioSocket] Writer closed mid-playback at chunk {chunk_num}')
+                if self.diag:
+                    self.diag.socket_close_reason = "writer_closing_during_playback"
                 break
             packet = bytes([0x10]) + len(chunk).to_bytes(2, "big") + chunk
             async with self._writer_lock:
                 self.writer.write(packet)
+                if self.diag:
+                    self.diag.audiosocket_frames_written += 1
+                    self.diag.audiosocket_bytes_written += len(chunk)
+                    self.diag.last_successful_write_time = time.monotonic()
+                    if self.diag.t_first_audiosocket_write_ms is None:
+                        self.diag.t_first_audiosocket_write_ms = (time.monotonic() - self.diag.t_start) * 1000
+
                 if chunk_num % 10 == 0 or chunk_num == total_chunks - 1:
                     try:
                         await self.writer.drain()
                     except Exception as e:
                         write_errors += 1
                         logger.error(f'[AudioSocket] Drain error at chunk {chunk_num}: {e}')
+                        if self.diag:
+                            self.diag.socket_close_reason = f"drain_error_{e}"
                         break
             
             chunk_num += 1
@@ -737,6 +834,13 @@ class AsteriskVoiceSession:
                     return b''
 
             ms = int((time.time() - start) * 1000)
+            if self.diag:
+                self.diag.tts_started = True
+                self.diag.tts_completed = True
+                self.diag.tts_output_bytes = len(pcm_8k)
+                self.diag.pcm_output_bytes = len(pcm_8k)
+                if self.diag.t_first_tts_audio_ms is None:
+                    self.diag.t_first_tts_audio_ms = (time.monotonic() - self.diag.t_start) * 1000
             logger.info(
                 f'[TTS] chunk #{chunk_idx} synthesized in {ms}ms, pcm_8k_bytes={len(pcm_8k)}, '
                 f'rate=8000, mono=True, sample_width=2'
@@ -1590,17 +1694,27 @@ class AsteriskVoiceSession:
         try:
             while True:
                 msg_type, payload = await read_packet(self.reader)
-                if msg_type in (0, 2):
+                if msg_type == 0:
                     logger.audiosocket_connection_closed("hangup")
+                    if self.diag:
+                        self.diag.socket_close_reason = "remote_hangup_msg0"
                     break
-                elif msg_type in (255, 3):
+                elif msg_type == 255:
                     logger.error(f'[AudioSocket] Error packet received ({msg_type}) for {self.call_uuid}: {payload}')
                     diagnostics.add_error("error", "audiosocket", f"AudioSocket error packet received: {payload}")
+                    if self.diag:
+                        self.diag.socket_close_reason = f"error_packet_255_{payload.hex() if payload else ''}"
                     break
-                elif msg_type == 4:
+                elif msg_type == 3:
+                    # DTMF digit from caller/Asterisk
+                    digit = payload.decode('ascii', errors='ignore') if payload else ''
+                    logger.info(f'[AudioSocket] DTMF received for {self.call_uuid}: {digit}')
+                    continue
+                elif msg_type in (2, 4):
+                    # Silence / Keepalive / Unassigned
                     continue
                 elif msg_type in (16, 1):
-                    if len(payload) > 0:
+                    if len(payload) > 0 and msg_type == 16:
                         self.last_audio_energy = calculate_pcm_rms(payload)
                         if self.stt_task is None or self.stt_task.done():
                             logger.warning('[AudioSocket] STT task was done/dead - restarting')
@@ -1608,6 +1722,10 @@ class AsteriskVoiceSession:
                         try:
                             self.audio_queue.put_nowait(payload)
                             self._packet_count = getattr(self, '_packet_count', 0) + 1
+                            if self.diag:
+                                self.diag.audiosocket_frames_received += 1
+                                if self.diag.t_first_caller_pcm_ms is None:
+                                    self.diag.t_first_caller_pcm_ms = (time.monotonic() - self.diag.t_start) * 1000
                             if self._packet_count == 1:
                                 logger.info(f'[AudioSocket] First audio frame received from Asterisk: {len(payload)} bytes, rms={self.last_audio_energy:.0f}')
                             elif self._packet_count % 100 == 0:
@@ -1674,6 +1792,7 @@ class AsteriskAudioSocketServer:
         logger.audiosocket_connection_accepted(peer[0], peer[1])
         call_uuid = None
         session = None
+        diag = None
         try:
             logger.uuid_read_started()
             msg_type, payload = await read_packet(reader)
@@ -1695,6 +1814,8 @@ class AsteriskAudioSocketServer:
                 await writer.wait_closed()
                 return
 
+            diag = CallMediaDiagnostics(call_uuid)
+            diag.uuid_packet_received = True
             logger.uuid_received(call_uuid)
             logger.set_context(session_uuid=call_uuid)
             
@@ -1702,11 +1823,15 @@ class AsteriskAudioSocketServer:
             context = await call_session_manager.get_call_context(call_uuid)
             if not context:
                 logger.agent_not_found(call_uuid)
+                diag.session_found = False
+                diag.socket_close_reason = "agent_not_found_in_session_manager"
+                logger.info(f"[MEDIA_DIAGNOSTICS] Summary for {call_uuid}: {json.dumps(diag.dump_summary())}")
                 diagnostics.add_error("error", "audiosocket", f"Failed to find registered call details for {call_uuid}")
                 writer.close()
                 await writer.wait_closed()
                 return
 
+            diag.session_found = True
             direction = context.get("direction", "inbound")
             caller = context.get("caller_id") or ""
             callee = context.get("dialed_number") or ""
@@ -1726,7 +1851,7 @@ class AsteriskAudioSocketServer:
                 agent_id=agent_id
             )
 
-            session = AsteriskVoiceSession(reader, writer, call_uuid, context)
+            session = AsteriskVoiceSession(reader, writer, call_uuid, context, diag=diag)
             call_session_manager.register_cleanup_callback(call_uuid, session.close_from_manager)
             call_session_manager.start_audio_session(call_uuid)
             self.active_connections[call_uuid] = asyncio.current_task()
@@ -1734,6 +1859,8 @@ class AsteriskAudioSocketServer:
             from app.services.call_admission_control import run_live_call_monitor
             async def hangup_callback(reason: str):
                 logger.warning(f"[AudioSocket] Hangup triggered by monitor for call {call_uuid}: reason={reason}")
+                if diag:
+                    diag.session_cleanup_reason = f"cac_monitor_{reason}"
                 try:
                     db = get_supabase_client()
                     db.table("calls").update({
@@ -1751,22 +1878,34 @@ class AsteriskAudioSocketServer:
                 finally:
                     monitor_task.cancel()
             except asyncio.CancelledError:
+                if diag:
+                    diag.socket_close_reason = "cancelled_error"
                 logger.audiosocket_connection_closed("cancelled")
             except (asyncio.IncompleteReadError, ConnectionError, BrokenPipeError, ConnectionResetError) as e:
+                if diag:
+                    diag.socket_close_reason = f"client_disconnect_{type(e).__name__}"
                 logger.info(f"[AudioSocket] Client disconnected normally during session: {e}")
             except Exception as e:
+                if diag:
+                    diag.socket_close_reason = f"exception_{type(e).__name__}_{e}"
                 logger.audiosocket_connection_error(e, "session_run")
                 diagnostics.add_error("error", "audiosocket", f"Session run error: {str(e)}")
 
         except (asyncio.IncompleteReadError, ConnectionError, BrokenPipeError, ConnectionResetError) as e:
+            if diag:
+                diag.socket_close_reason = f"handshake_disconnect_{type(e).__name__}"
             if "closed cleanly" in str(e):
                 logger.info(f"[AudioSocket] Port probe or clean disconnect during handshake: {e}")
             else:
                 logger.info(f"[AudioSocket] Client disconnected normally during handshake: {e}")
         except Exception as e:
+            if diag:
+                diag.socket_close_reason = f"handshake_error_{type(e).__name__}_{e}"
             logger.error(f"[AudioSocket] Unexpected error in handle_connection: {e}", exc_info=True)
             diagnostics.add_error("error", "audiosocket", f"Unexpected connection error: {str(e)}")
         finally:
+            if diag:
+                logger.info(f"[MEDIA_DIAGNOSTICS] Summary for {call_uuid}: {json.dumps(diag.dump_summary())}")
             if call_uuid:
                 self.active_connections.pop(call_uuid, None)
                 from app.services.call_session_manager import call_session_manager

@@ -35,14 +35,17 @@ else
 fi
 
 echo ""
-echo "[2/6] Syncing Dialplan & Reloading Asterisk:"
+echo "[2/6] Syncing PJSIP & Dialplan Configurations:"
 echo "------------------------------------------------------"
+if [ -f "/root/asterisk/deploy/asterisk/pjsip.conf" ]; then
+    cp /root/asterisk/deploy/asterisk/pjsip.conf /etc/asterisk/pjsip.conf
+    asterisk -rx "pjsip reload"
+    echo "PJSIP reloaded with latest trunk settings."
+fi
 if [ -f "/root/asterisk/deploy/asterisk/extensions.conf" ]; then
     cp /root/asterisk/deploy/asterisk/extensions.conf /etc/asterisk/extensions.conf
     asterisk -rx "dialplan reload"
     echo "Dialplan reloaded with [outbound-test-playback]."
-else
-    echo "Warning: /root/asterisk/deploy/asterisk/extensions.conf not found."
 fi
 
 echo ""
@@ -55,8 +58,8 @@ rm -f "$LOG_CAPTURE" "$PCAP_CAPTURE"
 asterisk -rx "pjsip set logger on"
 asterisk -rx "rtp set debug on"
 
-# Start Asterisk console capture in background
-timeout 22 asterisk -rvvvvv > "$LOG_CAPTURE" 2>&1 &
+# Start Asterisk console capture in background (with -n for batch non-TTY output)
+timeout 22 asterisk -rvvvvv -n > "$LOG_CAPTURE" 2>&1 &
 AST_PID=$!
 
 # Start tcpdump if available
@@ -103,6 +106,12 @@ echo "Media capture stopped."
 echo ""
 echo "[6/6] DIAGNOSTIC MEDIA ANALYSIS & FINDINGS:"
 echo "======================================================================"
+
+if [ -f "$PCAP_CAPTURE" ] && command -v tcpdump >/dev/null 2>&1; then
+    echo "--- A. SIP SDP Media Negotiation (from tcpdump pcap) ---"
+    tcpdump -r "$PCAP_CAPTURE" -A -s 0 "port 5060" 2>/dev/null | grep -E "(c=IN|m=audio|a=rtpmap|a=sendrecv)" | head -n 20 || true
+    echo ""
+fi
 
 if [ -f "$LOG_CAPTURE" ]; then
     echo "--- A. SIP INVITE (Outbound SDP Offer from Asterisk) ---"

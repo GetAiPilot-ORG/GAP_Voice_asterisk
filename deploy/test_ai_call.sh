@@ -51,9 +51,34 @@ if [ -f "/root/asterisk/deploy/asterisk/extensions.conf" ]; then
 fi
 
 echo ""
-echo "[3/4] Triggering Real AI Voice Call via FastAPI Backend:"
+echo "[3/4] Generating Workspace Admin Auth Token & Triggering Call:"
 echo "------------------------------------------------------"
+AUTH_TOKEN=$(python3 -c "
+import jwt, time, base64, os
+env_file = '/root/asterisk/backend/.env'
+secret_raw = ''
+if os.path.exists(env_file):
+    with open(env_file) as f:
+        for line in f:
+            if line.startswith('SUPABASE_JWT_SECRET='):
+                secret_raw = line.split('=', 1)[1].strip().strip('\"').strip('\'')
+try:
+    secret = base64.b64decode(secret_raw)
+except Exception:
+    secret = secret_raw
+
+payload = {
+    'sub': '9dfaaf1d-02c9-4f2e-aec9-e3d1f5154ae7',
+    'role': 'authenticated',
+    'aud': 'authenticated',
+    'exp': int(time.time()) + 7200
+}
+token = jwt.encode(payload, secret, algorithm='HS256')
+print(token)
+")
+
 RESP=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "$API_URL" \
+  -H "Authorization: Bearer ${AUTH_TOKEN}" \
   -H "Content-Type: application/json" \
   -d "{\"to_number\": \"${TARGET_NUMBER}\", \"confirm_real_dialing\": true}")
 

@@ -446,8 +446,8 @@ async def test_call(
         if caller_id.startswith('+'):
             caller_id = caller_id[1:]
 
-        # Answer-gated originate: PJSIP channel originates directly, executes outbound-ai-answered ONLY upon answer
-        originate_cmd_str = f"asterisk -rx 'channel originate PJSIP/{dial_number}@{endpoint_name} extension {call_id}@outbound-ai-answered'"
+        # Answer-gated originate: Local channel sets CLI/PAI, executes outbound-ai-answered ONLY upon answer
+        originate_cmd_str = f"asterisk -rx 'channel originate Local/{dial_number}*{endpoint_name}*{caller_id}@outbound-dial-carrier/n extension {call_id}@outbound-ai-answered'"
 
         call_originated = False
 
@@ -485,7 +485,7 @@ async def test_call(
                     )
                     
                 # 3. Execute answer-gated originate directly
-                originate_cmd = f"channel originate PJSIP/{dial_number}@{endpoint_name} extension {call_id}@outbound-ai-answered"
+                originate_cmd = f"channel originate Local/{dial_number}*{endpoint_name}*{caller_id}@outbound-dial-carrier/n extension {call_id}@outbound-ai-answered"
                 res = execute_asterisk_cli(originate_cmd)
                 if res["returncode"] != 0:
                     raise HTTPException(
@@ -563,7 +563,7 @@ async def test_call(
                         ssh_cmd += ["-i", ssh_key]
                     ssh_cmd += [
                         f"{ssh_user}@{ssh_host}",
-                        f"asterisk -rx 'channel originate PJSIP/{dial_number}@{endpoint_name} extension {call_id}@outbound-ai-answered'"
+                        f"asterisk -rx 'channel originate Local/{dial_number}*{endpoint_name}*{caller_id}@outbound-dial-carrier/n extension {call_id}@outbound-ai-answered'"
                     ]
                     try:
                         # Increased timeout to 60 seconds to accommodate network/routing latency
@@ -579,7 +579,7 @@ async def test_call(
                 # Strategy 3: Run asterisk locally (only if not on Windows or as last resort local fallback)
                 if not call_originated:
                     import platform
-                    orig_cmd = f"channel originate PJSIP/{dial_number}@{endpoint_name} extension {call_id}@outbound-ai-answered"
+                    orig_cmd = f"channel originate Local/{dial_number}*{endpoint_name}*{caller_id}@outbound-dial-carrier/n extension {call_id}@outbound-ai-answered"
                     if platform.system() == "Windows":
                         cmd = ["wsl", "-u", "root", "bash", "-c", f"asterisk -rx {shlex.quote(orig_cmd)}"]
                     else:
@@ -944,8 +944,8 @@ async def asterisk_outbound_call(body: Dict[str, Any], db: Client = Depends(get_
     if caller_id.startswith('+'):
         caller_id = caller_id[1:]
 
-    # Answer-gated originate: PJSIP channel originates directly, executes outbound-ai-answered ONLY upon answer
-    orig_cmd = f"channel originate PJSIP/{dial_number}@{endpoint_name} extension {call_uuid}@outbound-ai-answered"
+    # Answer-gated originate: Local channel sets CLI/PAI, executes outbound-ai-answered ONLY upon answer
+    orig_cmd = f"channel originate Local/{dial_number}*{endpoint_name}*{caller_id}@outbound-dial-carrier/n extension {call_uuid}@outbound-ai-answered"
 
     call_originated = False
 

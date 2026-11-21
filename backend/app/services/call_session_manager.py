@@ -18,6 +18,22 @@ class CallSessionManager:
     def _init(self):
         self.active_calls = {}
         self.cleanup_callbacks = {}
+        self.uniqueid_to_call_uuid = {}
+
+    def link_uniqueid(self, asterisk_uniqueid: str, call_uuid: str) -> None:
+        """Map Asterisk channel uniqueid to canonical RFC 4122 call_uuid."""
+        if asterisk_uniqueid and call_uuid:
+            self.uniqueid_to_call_uuid[asterisk_uniqueid] = call_uuid
+
+    def resolve_call_uuid(self, identifier: str) -> Optional[str]:
+        """Resolve either a canonical call_uuid or an Asterisk channel uniqueid to the call_uuid."""
+        if not identifier:
+            return None
+        if identifier in self.active_calls:
+            return identifier
+        if identifier in self.uniqueid_to_call_uuid:
+            return self.uniqueid_to_call_uuid[identifier]
+        return identifier
 
     def register_inbound_asterisk_call(
         self,
@@ -27,17 +43,20 @@ class CallSessionManager:
         workspace_id: str,
         agent_id: str,
         phone_number_id: str,
+        asterisk_uniqueid: Optional[str] = None,
+        direction: str = "inbound",
     ) -> Dict[str, Any]:
-        logger.info(f"[CallSessionManager] Registering inbound call {call_uuid} for agent {agent_id}")
+        logger.info(f"[CallSessionManager] Registering call {call_uuid} (direction={direction}, uniqueid={asterisk_uniqueid}) for agent {agent_id}")
         context = {
             "call_uuid": call_uuid,
+            "asterisk_uniqueid": asterisk_uniqueid,
             "caller_id": caller_id,
             "dialed_number": dialed_number,
             "workspace_id": workspace_id,
             "agent_id": agent_id,
             "phone_number_id": phone_number_id,
             "provider": "asterisk",
-            "direction": "inbound",
+            "direction": direction,
             "status": "created",
             "created_at": datetime.now(timezone.utc).isoformat(),
             "started_at": None,
@@ -46,25 +65,34 @@ class CallSessionManager:
             "cost_cents": 0
         }
         self.active_calls[call_uuid] = context
+        if asterisk_uniqueid:
+            self.uniqueid_to_call_uuid[asterisk_uniqueid] = call_uuid
         return context
 
-    async def get_call_context(self, call_uuid: str) -> Optional[Dict[str, Any]]:
+    async def get_call_context(self, identifier: str) -> Optional[Dict[str, Any]]:
+        call_uuid = self.resolve_call_uuid(identifier) or identifier
         context = self.active_calls.get(call_uuid)
         if not context:
             try:
                 db = get_supabase_client()
                 def _query():
-                    return db.table("calls").select("*").eq("call_uuid", call_uuid).execute()
+                    # Query by call_uuid primary key or metadata asterisk_uniqueid
+                    res = db.table("calls").select("*").eq("call_uuid", call_uuid).execute()
+                    if not res.data:
+                        res = db.table("calls").select("*").eq("id", call_uuid).execute()
+                    return res
                 res = await asyncio.to_thread(_query)
                 if res.data:
                     row = res.data[0]
                     context = self.register_inbound_asterisk_call(
-                        call_uuid=call_uuid,
+                        call_uuid=row.get("call_uuid") or row.get("id"),
                         caller_id=row.get("caller_id") or row.get("caller_phone_number") or "",
                         dialed_number=row.get("dialed_number") or "",
                         workspace_id=row.get("workspace_id"),
                         agent_id=row.get("agent_id"),
-                        phone_number_id=row.get("phone_number_id"),
+                        phone_number_id=row.get("did_number_id") or row.get("phone_number_id"),
+                        asterisk_uniqueid=row.get("metadata", {}).get("asterisk_uniqueid") if isinstance(row.get("metadata"), dict) else None,
+                        direction=row.get("direction") or "outbound"
                     )
                     context["status"] = row.get("status")
             except Exception as e:
@@ -79,25 +107,46 @@ class CallSessionManager:
                     agent = await asyncio.to_thread(fetch_agent_with_context, db, agent_id)
                     if agent:
                         kb_meta = agent.get("kb_metadata") or {}
+                        lang = agent.get("language") or "hi-IN"
+                        raw_voice_id = (agent.get("voice_id") or "").strip()
+                        raw_provider = (agent.get("voice_provider") or kb_meta.get("tts_provider") or "").lower()
+
+                        # Determine if this agent uses Sarvam (Hindi/Hinglish or explicit Sarvam voice/provider)
+                        is_sarvam_voice = raw_voice_id.lower() in ("shreya", "shubh", "meera", "manan", "ishita", "arjun")
+                        is_hindi_lang = lang.lower().startswith("hi")
+
+                        if is_sarvam_voice or raw_provider == "sarvam" or (is_hindi_lang and raw_provider not in ("elevenlabs", "playht")):
+                            tts_provider = "sarvam"
+                            voice_id = raw_voice_id if raw_voice_id else "shreya"
+                        elif raw_provider == "elevenlabs":
+                            tts_provider = "elevenlabs"
+                            voice_id = raw_voice_id or "21m00Tcm4TlvDq8ikWAM"
+                        else:
+                            tts_provider = raw_provider or "deepgram"
+                            voice_id = raw_voice_id or "aura-asteria-en"
+
                         context["agent_config"] = {
                             "name": agent.get("name"),
-                            "model": agent.get("model"),
-                            "language": agent.get("language") or "hi-IN",
-                            "voice_id": agent.get("voice_id") or "aura-asteria-en",
-                            "tts_provider": kb_meta.get("tts_provider") or "deepgram",
+                            "model": agent.get("model") or "gpt-4o-mini",
+                            "language": lang,
+                            "voice_id": voice_id,
+                            "tts_provider": tts_provider,
+                            "first_message": agent.get("first_message") or agent.get("greeting") or "",
+                            "greeting": agent.get("greeting") or agent.get("first_message") or "",
                             "agent_system_prompt": agent.get("agent_system_prompt") or "",
                             "system_prompt": agent.get("system_prompt") or "",
                             "knowledge_base": agent.get("knowledge_base") or "",
                             "voice_gender": kb_meta.get("voice_gender") or "female",
-                            "voice_speed": agent.get("voice_speed"),
+                            "voice_speed": agent.get("voice_speed") or 1.0,
                         }
-                        logger.info(f"[CallSessionManager] Loaded agent config for call {call_uuid}")
+                        logger.info(f"[CallSessionManager] Loaded agent config for call {call_uuid}: provider={tts_provider}, voice={voice_id}, lang={lang}")
                 except Exception as e:
                     logger.error(f"[CallSessionManager] Failed to load agent details for call {call_uuid}: {e}")
             return context
         return None
 
-    def start_audio_session(self, call_uuid: str) -> bool:
+    def start_audio_session(self, identifier: str) -> bool:
+        call_uuid = self.resolve_call_uuid(identifier) or identifier
         context = self.active_calls.get(call_uuid)
         if not context:
             return False
@@ -115,10 +164,16 @@ class CallSessionManager:
             except Exception as e:
                 logger.error(f"[CallSessionManager] DB status update error for {call_uuid}: {e}")
 
-        asyncio.create_task(asyncio.to_thread(_update))
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(asyncio.to_thread(_update))
+        except RuntimeError:
+            import threading
+            threading.Thread(target=_update, daemon=True).start()
         return True
 
-    def end_call(self, call_uuid: str, reason: str = "hangup") -> bool:
+    def end_call(self, identifier: str, reason: str = "hangup") -> bool:
+        call_uuid = self.resolve_call_uuid(identifier) or identifier
         context = self.active_calls.get(call_uuid)
         if not context:
             # Still attempt to release from Redis even if context was cleaned up
@@ -128,6 +183,11 @@ class CallSessionManager:
             except Exception:
                 pass
             return False
+
+        # Idempotency check: avoid duplicate finalization, billing calculation, or counter updates
+        if context.get("status") == "completed":
+            logger.info(f"[CallSessionManager] Call {call_uuid} is already finalized (status=completed). Skipping duplicate end_call.")
+            return True
 
         # Release Redis slot
         try:
@@ -177,9 +237,16 @@ class CallSessionManager:
 
         def _update():
             try:
+                # Map terminal call status accurately
+                terminal_status = "completed"
+                if reason in ("no_answer", "busy", "user_busy"):
+                    terminal_status = "no_answer" if "no_answer" in reason else "busy"
+                elif reason in ("call_rejected", "rejected", "failed", "cancelled", "did_inactive", "agent_not_found"):
+                    terminal_status = "failed"
+
                 # Update call row in DB
                 db.table("calls").update({
-                    "status": "completed",
+                    "status": terminal_status,
                     "ended_at": context["ended_at"],
                     "duration_seconds": duration,
                     "actual_duration": duration,
@@ -192,7 +259,16 @@ class CallSessionManager:
                     cost_data["call_id"] = call_uuid
                     cost_data["cost_status"] = "final"
                     cost_data["cost_finalized_at"] = datetime.now(timezone.utc).isoformat()
-                    db.table("call_usage").upsert(cost_data, on_conflict="call_id").execute()
+                    try:
+                        db.table("call_usage").upsert(cost_data, on_conflict="call_id").execute()
+                    except Exception as usage_err:
+                        # Fallback if credits_used is not in the call_usage schema cache
+                        if "credits_used" in cost_data:
+                            safe_cost_data = {k: v for k, v in cost_data.items() if k != "credits_used"}
+                            try:
+                                db.table("call_usage").upsert(safe_cost_data, on_conflict="call_id").execute()
+                            except Exception:
+                                pass
 
                 # Update workspace monthly usage counter
                 workspace_id = context.get("workspace_id")
@@ -227,7 +303,12 @@ class CallSessionManager:
             except Exception as e:
                 logger.error(f"[CallSessionManager] DB update error on end_call {call_uuid}: {e}")
 
-        asyncio.create_task(asyncio.to_thread(_update))
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(asyncio.to_thread(_update))
+        except RuntimeError:
+            import threading
+            threading.Thread(target=_update, daemon=True).start()
         return True
 
     def register_cleanup_callback(self, call_uuid: str, callback: Callable[[str], None]) -> None:

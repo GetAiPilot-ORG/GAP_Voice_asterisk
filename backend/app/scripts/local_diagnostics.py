@@ -82,14 +82,15 @@ def main():
         if redis_required:
             sys.exit(1)
 
-    # 6. Check AudioSocket Listener status (port 9092)
+    # 6. Check AudioSocket Listener status
     audiosocket_listening = False
+    as_port = settings.asterisk_audiosocket_port or 9092
     try:
-        with socket.create_connection(("127.0.0.1", 9092), timeout=1.0) as s:
+        with socket.create_connection(("127.0.0.1", as_port), timeout=1.0) as s:
             audiosocket_listening = True
-            print("[ OK ] AudioSocket server is listening on 127.0.0.1:9092.")
+            print(f"[ OK ] AudioSocket server is listening on 127.0.0.1:{as_port}.")
     except Exception as e:
-        print(f"[WARN] AudioSocket server is NOT listening on 127.0.0.1:9092: {e}")
+        print(f"[WARN] AudioSocket server is NOT listening on 127.0.0.1:{as_port}: {e}")
 
     # 7. Check Asterisk CLI & Version
     from app.services.asterisk_cli import execute_asterisk_cli_cmd

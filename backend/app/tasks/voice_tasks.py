@@ -174,7 +174,8 @@ def run_voice_call(task_id: str, payload: Dict[str, Any], attempt: int = 1):
                 dialed_number=to_number,
                 workspace_id=str(workspace_id),
                 agent_id=str(agent_id),
-                phone_number_id=str(did_number_id) if did_number_id else ""
+                phone_number_id=str(did_number_id) if did_number_id else "",
+                direction="outbound"
             )
 
             # Insert ringing call record
@@ -211,16 +212,13 @@ def run_voice_call(task_id: str, payload: Dict[str, Any], attempt: int = 1):
             except Exception:
                 provider_type = "custom"
 
-            if provider_type != "twilio":
-                if dial_number.startswith('+'):
-                    if dial_number.startswith('+91'):
-                        dial_number = dial_number[1:]
-
-            if not dial_number.startswith('+'):
-                dial_number = '+' + dial_number
+            from app.api.v1.calls import format_pstn_dial_number
+            dial_number = format_pstn_dial_number(dial_number, provider_type)
 
             endpoint_name = f"provider-{trunk_id}"
-            caller_id = from_number or "+18166536732"
+            caller_id = from_number or "911168140253"
+            if caller_id.startswith('+'):
+                caller_id = caller_id[1:]
 
             # Prepare originate command execution functions
             from app.api.v1.calls import execute_asterisk_cli, is_audiosocket_listening
@@ -231,14 +229,15 @@ def run_voice_call(task_id: str, payload: Dict[str, Any], attempt: int = 1):
             try:
                 if settings.asterisk_mode == "local":
                     if not is_audiosocket_listening():
-                        raise ValueError("AudioSocket server is not listening on 127.0.0.1:9092")
+                        raise ValueError(f"AudioSocket server is not listening on 127.0.0.1:{settings.asterisk_audiosocket_port}")
 
                     from app.services.asterisk_cli import verify_endpoint_status
                     validation = verify_endpoint_status(endpoint_name)
                     if validation["status"] != "valid":
                         raise ValueError(validation["message"])
 
-                    orig_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:9092"
+                    # Answer-gated originate: Local channel sets CLI/PAI, executes outbound-ai-answered ONLY upon answer
+                    orig_cmd = f"channel originate Local/{dial_number}*{endpoint_name}*{caller_id}@outbound-dial-carrier/n extension {call_id}@outbound-ai-answered"
                     res = execute_asterisk_cli(orig_cmd)
                     if res["returncode"] != 0:
                         raise ValueError(f"Asterisk local originate failed (code {res['returncode']}): {res['stderr'] or res['stdout']}")
@@ -273,7 +272,8 @@ def run_voice_call(task_id: str, payload: Dict[str, Any], attempt: int = 1):
                                         dialed_number=to_number,
                                         workspace_id=str(workspace_id),
                                         agent_id=str(agent_id),
-                                        phone_number_id=str(did_number_id) if did_number_id else ""
+                                        phone_number_id=str(did_number_id) if did_number_id else "",
+                                        direction="outbound"
                                     )
                                     try:
                                         db.table("calls").delete().eq("id", call_id).execute()
@@ -295,7 +295,7 @@ def run_voice_call(task_id: str, payload: Dict[str, Any], attempt: int = 1):
                             ssh_cmd += ["-i", ssh_key]
                         ssh_cmd += [
                             f"{ssh_user}@{ssh_host}",
-                            f"asterisk -rx 'channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:9092'"
+                            f"asterisk -rx 'channel originate Local/{dial_number}*{endpoint_name}*{caller_id}@outbound-dial-carrier/n extension {call_id}@outbound-ai-answered'"
                         ]
                         try:
                             import subprocess
@@ -311,11 +311,11 @@ def run_voice_call(task_id: str, payload: Dict[str, Any], attempt: int = 1):
                     if not call_originated:
                         import platform
                         import shlex
-                        orig_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:9092"
+                        orig_cmd = f"channel originate Local/{dial_number}*{endpoint_name}*{caller_id}@outbound-dial-carrier/n extension {call_id}@outbound-ai-answered"
                         if platform.system() == "Windows":
                             cmd = ["wsl", "-u", "root", "bash", "-c", f"asterisk -rx {shlex.quote(orig_cmd)}"]
                         else:
-                            cmd = ["asterisk", "-rx", f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:9092"]
+                            cmd = ["asterisk", "-rx", orig_cmd]
                         try:
                             res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
                             if res.returncode == 0:

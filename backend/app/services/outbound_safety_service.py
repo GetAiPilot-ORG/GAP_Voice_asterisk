@@ -239,12 +239,16 @@ async def verify_outbound_dial_safety(
                     return res
 
         # 4. Destination Phone Format Validation
-        phone_clean = phone_number.strip()
+        raw_phone = phone_number.strip() if phone_number else ""
+        phone_clean = re.sub(r"[\s\-\(\)\.]+", "", raw_phone)
+        if phone_clean and not phone_clean.startswith("+"):
+            phone_clean = "+" + phone_clean
+
         if not phone_clean or not re.match(r"^\+[1-9]\d{1,14}$", phone_clean):
             res = DialSafetyResult(
                 allowed=False,
                 reason_code="invalid_number",
-                human_readable_reason=f"Phone number '{phone_clean}' is not valid E.164 format",
+                human_readable_reason=f"Phone number '{raw_phone}' is not valid E.164 format",
                 safe_to_retry=False,
                 should_pause_campaign=False
             )
@@ -344,8 +348,10 @@ async def verify_outbound_dial_safety(
             if settings.asterisk_mode == "local":
                 import socket
                 audiosocket_listening = False
+                as_host = settings.asterisk_audiosocket_host or "127.0.0.1"
+                as_port = settings.asterisk_audiosocket_port or 9092
                 try:
-                    with socket.create_connection(("127.0.0.1", 9092), timeout=1.0):
+                    with socket.create_connection((as_host, as_port), timeout=1.0):
                         audiosocket_listening = True
                 except Exception:
                     pass
@@ -353,7 +359,7 @@ async def verify_outbound_dial_safety(
                     res = DialSafetyResult(
                         allowed=False,
                         reason_code="asterisk_unavailable",
-                        human_readable_reason="Local AudioSocket listener is not active on port 9092",
+                        human_readable_reason=f"Local AudioSocket listener is not active on {as_host}:{as_port}",
                         safe_to_retry=True,
                         should_pause_campaign=True
                     )

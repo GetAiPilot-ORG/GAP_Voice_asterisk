@@ -42,7 +42,12 @@ echo "------------------------------------------------------"
 if [ -f "/root/asterisk/deploy/asterisk/pjsip.conf" ]; then
     cp /root/asterisk/deploy/asterisk/pjsip.conf /etc/asterisk/pjsip.conf
     asterisk -rx "pjsip reload"
-    echo "  [OK] PJSIP reloaded (allow=ulaw,alaw restored for 24IT Hub)."
+    echo "  [OK] PJSIP reloaded (allow=ulaw,alaw, rtp_symmetric=no)."
+fi
+if [ -f "/root/asterisk/deploy/asterisk/rtp.conf" ]; then
+    cp /root/asterisk/deploy/asterisk/rtp.conf /etc/asterisk/rtp.conf
+    asterisk -rx "module reload res_rtp_asterisk.so" 2>/dev/null || true
+    echo "  [OK] RTP reloaded (strictrtp=no, probation=1)."
 fi
 if [ -f "/root/asterisk/deploy/asterisk/extensions.conf" ]; then
     cp /root/asterisk/deploy/asterisk/extensions.conf /etc/asterisk/extensions.conf

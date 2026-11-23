@@ -90,7 +90,7 @@ echo ""
 echo "[4/6] Originating Test Call to $TARGET_NUMBER:"
 echo "------------------------------------------------------"
 echo ">>> Executing Asterisk Originate..."
-asterisk -rx "channel originate Local/$TARGET_NUMBER*$ENDPOINT*911168140253@outbound-dial-carrier/n extension test@outbound-test-playback" || true
+asterisk -rx "channel originate Local/$TARGET_NUMBER@outbound-dial-carrier/n extension test@outbound-test-playback" || true
 
 echo ""
 echo ">>> CALL INITIATED! YOUR PHONE SHOULD RING NOW: $TARGET_NUMBER"

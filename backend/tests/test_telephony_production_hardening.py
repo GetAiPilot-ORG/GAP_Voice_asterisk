@@ -56,6 +56,7 @@ def test_asterisk_config_generator_pjsip_security():
     assert 'callerid="911168140253" <911168140253>' in pjsip
     assert "send_pai=yes" in pjsip
     assert "send_rpid=yes" in pjsip
+    assert "trust_id_outbound=yes" in pjsip
     assert "Anonymous" not in pjsip
 
     # 2. Symmetric RTP and NAT traversal
@@ -69,7 +70,9 @@ def test_asterisk_config_generator_pjsip_security():
     assert "match=202.89.78.2" in pjsip
     assert "match=159.65.156.202" in pjsip
 
-    # 4. Dialplan contains answer-gated outbound context
+    # 4. Dialplan contains answer-gated outbound context and carrier dialer
+    assert "[outbound-dial-carrier]" in ext
+    assert "[outbound-predial-handler]" in ext
     assert "[outbound-ai-answered]" in ext
     assert "[call-hangup-handler]" in ext
     assert "FILTER(0123456789" in ext

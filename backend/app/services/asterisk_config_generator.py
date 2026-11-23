@@ -41,8 +41,8 @@ class AsteriskConfigGenerator:
         if outbound_caller_id.startswith("+"):
             outbound_caller_id = outbound_caller_id[1:]
 
-        # Force codec safety: allow=alaw only (G.711 A-law is required for Indian PSTN termination)
-        codecs_str = "alaw"
+        # Force codec safety: allow=ulaw,alaw only
+        codecs_str = "ulaw,alaw"
         webhook_secret = settings.asterisk_webhook_secret or "your_shared_webhook_secret"
         transport_name = f"transport-{transport}"
  
@@ -72,6 +72,7 @@ class AsteriskConfigGenerator:
                 "rtp_keepalive=1",
                 "send_pai=yes",
                 "send_rpid=yes",
+                "trust_id_outbound=yes",
                 f"from_user={outbound_caller_id}",
                 f"from_domain={sip_proxy}",
                 f"callerid=\"{outbound_caller_id}\" <{outbound_caller_id}>",
@@ -126,6 +127,7 @@ class AsteriskConfigGenerator:
                 "rtp_keepalive=1",
                 "send_pai=yes",
                 "send_rpid=yes",
+                "trust_id_outbound=yes",
                 "",
                 f"[provider-{trunk_id}-reg]",
                 "type=registration",
@@ -179,6 +181,28 @@ class AsteriskConfigGenerator:
             " same => n,Hangup(21)",
             "",
             f"exten => h,1,NoOp(Channel hung up on provider-{trunk_id}: ${{HANGUPCAUSE}})",
+            "",
+            "; === Outbound Carrier Dialer Context ===",
+            "[outbound-dial-carrier]",
+            "exten => _[+0-9].,1,NoOp(--- OUTBOUND DIAL CARRIER: ${EXTEN} ---)",
+            " same => n,Set(TARGET_NUM=${EXTEN})",
+            f" same => n,Set(TARGET_TRUNK=provider-{trunk_id})",
+            f" same => n,Set(TARGET_CLI={outbound_caller_id})",
+            " same => n,Set(CALLERID(all)=\"${TARGET_CLI}\" <${TARGET_CLI}>)",
+            " same => n,Set(CALLERID(num)=${TARGET_CLI})",
+            " same => n,Set(CALLERID(name)=${TARGET_CLI})",
+            " same => n,Dial(PJSIP/${TARGET_NUM}@${TARGET_TRUNK},60,b(outbound-predial-handler^s^1))",
+            " same => n,Hangup()",
+            "",
+            "[outbound-predial-handler]",
+            "exten => s,1,NoOp(--- OUTBOUND PRE-DIAL HANDLER: Setting Headers on PJSIP Leg ---)",
+            f" same => n,Set(OUT_CLI={outbound_caller_id})",
+            " same => n,Set(CALLERID(all)=\"${OUT_CLI}\" <${OUT_CLI}>)",
+            " same => n,Set(CALLERID(num)=${OUT_CLI})",
+            " same => n,Set(CALLERID(name)=${OUT_CLI})",
+            f" same => n,Set(PJSIP_HEADER(add,P-Asserted-Identity)=<sip:${{OUT_CLI}}@{sip_proxy}>)",
+            f" same => n,Set(PJSIP_HEADER(add,Remote-Party-ID)=<sip:${{OUT_CLI}}@{sip_proxy}>\\;party=calling\\;privacy=off\\;screen=no)",
+            " same => n,Return()",
             "",
             "; === Outbound Answer-Gated Media Context ===",
             "[outbound-ai-answered]",

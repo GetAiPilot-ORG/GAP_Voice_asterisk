@@ -90,13 +90,13 @@ echo ""
 echo "[4/6] Originating Test Call to $TARGET_NUMBER:"
 echo "------------------------------------------------------"
 echo ">>> Executing Asterisk Originate..."
-asterisk -rx "channel originate Local/$TARGET_NUMBER@outbound-dial-carrier/n extension test@outbound-test-playback" || true
+asterisk -rx "channel originate Local/$TARGET_NUMBER@outbound-dial-carrier extension test@outbound-test-playback" || true
 
 echo ""
 echo ">>> CALL INITIATED! YOUR PHONE SHOULD RING NOW: $TARGET_NUMBER"
 echo ">>> PLEASE ANSWER THE CALL AND LISTEN CAREFULLY."
-echo ">>> Capturing 15 seconds of media traffic..."
-for i in $(seq 15 -1 1); do
+echo ">>> Capturing 30 seconds of media traffic..."
+for i in $(seq 30 -1 1); do
     printf "\rWaiting for media capture... %2d seconds remaining" "$i"
     sleep 1
 done

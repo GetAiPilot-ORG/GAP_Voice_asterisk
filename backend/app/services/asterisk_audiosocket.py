@@ -1,12 +1,20 @@
+from __future__ import annotations
+import hashlib
+from collections import OrderedDict
+
+# Global in-memory LRU cache for synthesized greetings: (agent_id, voice_id, language, text_hash) -> pcm_8k
+_GREETING_CACHE: OrderedDict[tuple, bytes] = OrderedDict()
+_GREETING_CACHE_MAX_SIZE = 100
 import asyncio
 import json
 import logging
 import re
 import time
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, AsyncGenerator
 
 import traceback
+import websockets
 
 from app.core.config import settings
 from app.db.client import get_supabase_client
@@ -73,6 +81,66 @@ def format_packet(msg_type: int, payload: bytes) -> bytes:
     return header + payload
 
 
+class CallMediaDiagnostics:
+    """Per-call structured diagnostics for telephony AudioSocket media path verification."""
+    def __init__(self, call_uuid: str):
+        self.call_uuid = call_uuid
+        self.t_start = time.monotonic()
+        self.asterisk_uniqueid: Optional[str] = None
+        self.direction: str = "unknown"
+        self.session_found: bool = False
+        self.tenant_resolved: bool = False
+        self.agent_resolved: bool = False
+        self.socket_connected: bool = True
+        self.uuid_packet_received: bool = False
+        self.greeting_triggered: bool = False
+        self.tts_started: bool = False
+        self.tts_completed: bool = False
+        self.tts_output_bytes: int = 0
+        self.pcm_output_bytes: int = 0
+        self.audiosocket_frames_written: int = 0
+        self.audiosocket_bytes_written: int = 0
+        self.audiosocket_frames_received: int = 0
+        self.last_successful_write_time: float = 0.0
+        self.socket_close_reason: str = "in_progress"
+        self.session_cleanup_reason: str = "in_progress"
+
+        # Timings (ms relative to connection start)
+        self.t_greeting_start_ms: Optional[float] = None
+        self.t_first_tts_audio_ms: Optional[float] = None
+        self.t_first_audiosocket_write_ms: Optional[float] = None
+        self.t_first_caller_pcm_ms: Optional[float] = None
+
+    def dump_summary(self) -> dict:
+        duration_s = round(time.monotonic() - self.t_start, 3)
+        return {
+            "call_uuid": self.call_uuid,
+            "asterisk_uniqueid": self.asterisk_uniqueid,
+            "direction": self.direction,
+            "duration_s": duration_s,
+            "session_found": self.session_found,
+            "tenant_resolved": self.tenant_resolved,
+            "agent_resolved": self.agent_resolved,
+            "socket_connected": self.socket_connected,
+            "uuid_packet_received": self.uuid_packet_received,
+            "greeting_triggered": self.greeting_triggered,
+            "tts_started": self.tts_started,
+            "tts_completed": self.tts_completed,
+            "tts_output_bytes": self.tts_output_bytes,
+            "pcm_output_bytes": self.pcm_output_bytes,
+            "frames_written": self.audiosocket_frames_written,
+            "bytes_written": self.audiosocket_bytes_written,
+            "frames_received": self.audiosocket_frames_received,
+            "last_write_ms": round((self.last_successful_write_time - self.t_start) * 1000, 1) if self.last_successful_write_time else None,
+            "timing_greeting_start_ms": round(self.t_greeting_start_ms, 1) if self.t_greeting_start_ms else None,
+            "timing_first_tts_audio_ms": round(self.t_first_tts_audio_ms, 1) if self.t_first_tts_audio_ms else None,
+            "timing_first_write_ms": round(self.t_first_audiosocket_write_ms, 1) if self.t_first_audiosocket_write_ms else None,
+            "timing_first_caller_pcm_ms": round(self.t_first_caller_pcm_ms, 1) if self.t_first_caller_pcm_ms else None,
+            "socket_close_reason": self.socket_close_reason,
+            "session_cleanup_reason": self.session_cleanup_reason
+        }
+
+
 class AsteriskVoiceSession:
     """
     Handles a single active call session over raw TCP AudioSocket.
@@ -100,22 +168,64 @@ class AsteriskVoiceSession:
         last_w = words[-1].lower()
         ends_punc = len(transcript) > 0 and transcript[-1] in ('.', '?', '!', '।')
         if last_w in cls.TRAILING_CONNECTORS:
-            return "incomplete", 0.70
+            return "incomplete", voice_cfg.TURN_COMMIT_CONNECTOR_WAIT_MS / 1000.0
         elif ends_punc:
-            return "complete", 0.25
-        return "standard", 0.45
+            return "complete", 0.0
+        return "standard", 0.0
+
+    def _schedule_commit(self, wait_s: float) -> None:
+        """
+        Schedules a turn commit after wait_s seconds.
+        Cancels any existing commit task. At commit time, reads accumulated_transcript,
+        clears accumulator, sets turn_state='COMMITTED', records commit timestamp,
+        cancels LLM/TTS if running, and launches run_llm_tts_pipeline.
+        """
+        if self.turn_commit_task and not self.turn_commit_task.done():
+            self.turn_commit_task.cancel()
+            self.turn_commit_task = None
+
+        async def _commit_job():
+            try:
+                if wait_s > 0:
+                    await asyncio.sleep(wait_s)
+                text = self.accumulated_transcript.strip()
+                if not text:
+                    logger.debug("[TurnSM] Scheduled commit fired but accumulated transcript is empty")
+                    return
+                self.turn_state = 'COMMITTED'
+                self.accumulated_transcript = ""
+                self.first_final_time = 0.0
+                self.turn_commit_timestamp = time.time()
+                logger.info(f"[TurnSM] Turn COMMITTED (after {int(wait_s*1000)}ms wait): '{text}'")
+                await self.cancel_llm_tts()
+                self.llm_tts_task = asyncio.create_task(
+                    self.run_llm_tts_pipeline(text)
+                )
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(f"[TurnSM] Error in _commit_job: {e}", exc_info=True)
+
+        self.turn_commit_task = asyncio.create_task(_commit_job())
 
     def __init__(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         call_uuid: str,
-        context: dict
+        context: dict,
+        diag: Optional[CallMediaDiagnostics] = None,
     ) -> None:
         self.reader = reader
         self.writer = writer
         self.call_uuid = call_uuid
         self.context = context
+        self.diag = diag or CallMediaDiagnostics(call_uuid)
+        self.diag.asterisk_uniqueid = context.get('asterisk_uniqueid')
+        self.diag.direction = context.get('direction', 'inbound')
+        self.diag.session_found = bool(context)
+        self.diag.tenant_resolved = bool(context.get('workspace_id'))
+        self.diag.agent_resolved = bool(context.get('agent_id'))
         self.config = context.get('agent_config') or {}
         self.audio_queue = asyncio.Queue(maxsize=400)
         self.messages = []
@@ -136,6 +246,8 @@ class AsteriskVoiceSession:
         self.accumulated_transcript = ""
         self.turn_commit_task = None
         self.first_final_time = 0.0
+        self.turn_commit_timestamp = 0.0
+        self.t_speech_final = 0.0
         self.llm_service = LLMService(openai_key=settings.openai_api_key)
         # Serialises all writer.write()+drain() calls across pipeline tasks.
         # Prevents interleaved packets if a new pipeline starts while an old
@@ -248,6 +360,9 @@ class AsteriskVoiceSession:
         if self.tts_conn:
             await self.tts_conn.cancel()
 
+        if self.sarvam_tts_conn:
+            self.sarvam_tts_conn.ensure_connected_soon()
+
         # Lock barrier: if the cancelled task was mid write+drain when it got
         # the CancelledError, that write+drain holds _writer_lock. Acquiring
         # and immediately releasing here blocks until that lock is fully
@@ -295,18 +410,20 @@ class AsteriskVoiceSession:
                 else:
                     base += "\n\nOVERRIDE: You are a female Indian voice assistant. Use female Hinglish grammar rules: 'sakti hoon', 'gayi', 'leti hoon', 'deti hoon'. Do NOT use male phrases."
 
-        # Strict prompt instructions based on the selected language
+        # Strict phone/voice rules: maximum 20 words per reply, first sentence under 12 words
         if is_hindi:
             voice_prefix = (
                 "You are a real-time voice assistant on a phone call. You MUST answer in short, natural Hindi (Devanagari script). "
                 "Do NOT use Roman Hinglish. Speak and reply using clean, conversational Hindi. "
-                "Maximum response length: 1–2 sentences. Avoid long explanations. "
+                "Maximum 20 words per reply. First sentence under 12 words. One idea per reply. "
+                "Never read lists or full price tables unless the caller asks; summarize and offer details. "
                 "Keep replies brief, direct, and conversational."
             )
         else:
             voice_prefix = (
                 "You are a real-time voice assistant on a phone call. You MUST answer in short Hinglish. "
-                "Maximum response length: 1–2 sentences. Avoid long explanations. "
+                "Maximum 20 words per reply. First sentence under 12 words. One idea per reply. "
+                "Never read lists or full price tables unless the caller asks; summarize and offer details. "
                 "Use natural spoken language. Never generate paragraphs for voice calls. "
                 "Keep replies brief, direct, and conversational."
             )
@@ -318,14 +435,119 @@ class AsteriskVoiceSession:
 
     async def trigger_initial_greeting(self) -> None:
         """
-        Triggers the initial welcome greeting asynchronously.
+        Plays pre-synthesized greeting PCM immediately from cache if available,
+        starting speech in <50ms without waiting for LLM or TTS.
+        Falls back to pipeline on cache miss and populates cache.
         """
+        if getattr(self, "greeting_played", False) or getattr(self, "greeting_active", False):
+            logger.info(f'[AsteriskVoiceSession] Greeting already played/active for call {self.call_uuid}, skipping duplicate trigger')
+            return
+
         logger.info(f'[AsteriskVoiceSession] Triggering initial greeting for call {self.call_uuid}')
+        if self.diag:
+            self.diag.greeting_triggered = True
+            self.diag.t_greeting_start_ms = (time.monotonic() - self.diag.t_start) * 1000
+        agent_id = self.config.get('agent_id') or self.context.get('agent_id') or 'default'
+        voice_id = self.config.get('voice_id') or 'default'
+        language = (self.config.get('language') or 'hi-IN').lower()
+
+        # Fixed greeting text if configured on agent, otherwise default standard greeting
+        greeting_text = (self.config.get('first_message') or self.config.get('greeting') or '').strip()
+        if not greeting_text:
+            if language.startswith('hi'):
+                greeting_text = "Namaste! MetaBull Universe mein aapka swagat hai. Main aapki kya madad kar sakti hoon?"
+            else:
+                greeting_text = "Hello! Welcome to MetaBull Universe. How can I assist you today?"
+
+        text_hash = hashlib.sha256(greeting_text.encode('utf-8')).hexdigest()[:16]
+        cache_key = (agent_id, voice_id, language, text_hash)
+
+        if cache_key in _GREETING_CACHE:
+            pcm_8k = _GREETING_CACHE[cache_key]
+            _GREETING_CACHE.move_to_end(cache_key)
+            logger.info(f"[Greeting] Cache HIT for key {cache_key} ({len(pcm_8k)} bytes) - starting instant playback")
+            self.llm_tts_task = asyncio.create_task(self._play_cached_greeting(pcm_8k, greeting_text))
+        else:
+            logger.info(f"[Greeting] Cache MISS for key {cache_key} - synthesizing and caching")
+            async def _synth_and_cache():
+                try:
+                    pcm_8k = await self._synthesize_to_pcm_8k(greeting_text, 0)
+                    if pcm_8k:
+                        _GREETING_CACHE[cache_key] = pcm_8k
+                        if len(_GREETING_CACHE) > _GREETING_CACHE_MAX_SIZE:
+                            _GREETING_CACHE.popitem(last=False)
+                        logger.info(f"[Greeting] Cached {len(pcm_8k)} bytes for {cache_key}")
+                        await self._play_cached_greeting(pcm_8k, greeting_text)
+                    else:
+                        await self.run_llm_tts_pipeline('', is_greeting=True)
+                except Exception as e:
+                    logger.error(f"[Greeting] Synthesis fallback error: {e}")
+                    await self.run_llm_tts_pipeline('', is_greeting=True)
+
+            self.llm_tts_task = asyncio.create_task(_synth_and_cache())
+
+    async def _play_cached_greeting(self, pcm_8k: bytes, greeting_text: str) -> None:
+        """Plays raw 8kHz PCM directly through the AudioSocket writer with absolute deadline pacing."""
+        self.generation_id += 1
+        current_gen = self.generation_id
+        self.set_state('speaking')
+        self.speaking_started_at = time.time()
         self.greeting_active = True
         self.greeting_protected = True
-        self.llm_tts_task = asyncio.create_task(
-            self.run_llm_tts_pipeline('', is_greeting=True)
-        )
+
+        offset = 0
+        total_bytes = len(pcm_8k)
+        if self.diag:
+            self.diag.pcm_output_bytes = total_bytes
+        next_send_time = time.monotonic()
+        logger.info(f"[Greeting] Playing cached greeting ({total_bytes} bytes, ~{int(total_bytes/16)}ms) for call {self.call_uuid}")
+
+        try:
+            while offset < total_bytes and not self.barge_in_event.is_set():
+                if self.generation_id != current_gen:
+                    break
+                chunk = pcm_8k[offset:offset+320]
+                offset += 320
+
+                if self.writer.is_closing():
+                    if self.diag:
+                        self.diag.socket_close_reason = "writer_closing_during_greeting"
+                    break
+
+                packet = bytes([0x10]) + len(chunk).to_bytes(2, "big") + chunk
+                async with self._writer_lock:
+                    self.writer.write(packet)
+                    if self.diag:
+                        self.diag.audiosocket_frames_written += 1
+                        self.diag.audiosocket_bytes_written += len(chunk)
+                        self.diag.last_successful_write_time = time.monotonic()
+                        if self.diag.t_first_audiosocket_write_ms is None:
+                            self.diag.t_first_audiosocket_write_ms = (time.monotonic() - self.diag.t_start) * 1000
+
+                    if offset % (320 * 10) == 0 or offset >= total_bytes:
+                        try:
+                            await self.writer.drain()
+                        except Exception as e:
+                            logger.error(f"[Greeting] Drain error: {e}")
+                            if self.diag:
+                                self.diag.socket_close_reason = f"drain_error_{e}"
+                            break
+
+                next_send_time += 0.020
+                now = time.monotonic()
+                behind = now - next_send_time
+                if behind > 0.100:
+                    next_send_time = now
+                elif behind < 0:
+                    await asyncio.sleep(-behind)
+
+            self.messages.append({'role': 'assistant', 'content': greeting_text})
+        finally:
+            self.greeting_active = False
+            self.greeting_protected = False
+            self.greeting_played = True
+            self.set_state('idle')
+            logger.info(f"[Greeting] Initial greeting finished for call {self.call_uuid}")
 
     async def send_audio(self, audio_data: bytes, pcm_already_8khz: bool = False) -> None:
         """
@@ -371,6 +593,9 @@ class AsteriskVoiceSession:
         if not pcm_bytes:
             return
 
+        if self.diag:
+            self.diag.pcm_output_bytes += len(pcm_bytes)
+
         start_time = time.time()
         chunks = chunk_pcm_for_telephony(pcm_bytes, chunk_size=320)
         chunk_num = 0
@@ -381,22 +606,35 @@ class AsteriskVoiceSession:
         for chunk in chunks:
             if self.writer.is_closing():
                 logger.info(f'[AudioSocket] Writer closed mid-playback at chunk {chunk_num}')
+                if self.diag:
+                    self.diag.socket_close_reason = "writer_closing_during_playback"
                 break
             packet = bytes([0x10]) + len(chunk).to_bytes(2, "big") + chunk
             async with self._writer_lock:
                 self.writer.write(packet)
-                try:
-                    await self.writer.drain()
-                except Exception as e:
-                    write_errors += 1
-                    logger.error(f'[AudioSocket] Drain error at chunk {chunk_num}: {e}')
-                    break
+                if self.diag:
+                    self.diag.audiosocket_frames_written += 1
+                    self.diag.audiosocket_bytes_written += len(chunk)
+                    self.diag.last_successful_write_time = time.monotonic()
+                    if self.diag.t_first_audiosocket_write_ms is None:
+                        self.diag.t_first_audiosocket_write_ms = (time.monotonic() - self.diag.t_start) * 1000
+
+                if chunk_num % 10 == 0 or chunk_num == total_chunks - 1:
+                    try:
+                        await self.writer.drain()
+                    except Exception as e:
+                        write_errors += 1
+                        logger.error(f'[AudioSocket] Drain error at chunk {chunk_num}: {e}')
+                        if self.diag:
+                            self.diag.socket_close_reason = f"drain_error_{e}"
+                        break
             
             chunk_num += 1
-            logger.info(
-                f'[AudioSocket] sending chunk {chunk_num} payload={len(chunk)} '
-                f'packet={len(packet)}'
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f'[AudioSocket] sending chunk {chunk_num} payload={len(chunk)} '
+                    f'packet={len(packet)}'
+                )
             offset += len(chunk)
             await asyncio.sleep(0.02)
 
@@ -414,6 +652,126 @@ class AsteriskVoiceSession:
             state=self._state,
             audio_sent=offset
         )
+
+    async def _get_tts_conn(self, provider: str):
+        """
+        Lazily creates and connects the warm TTS connection for the given provider.
+        Shared between streaming generator, pre-warm, and fallback synthesis.
+        """
+        if provider == 'sarvam':
+            if self.sarvam_tts_conn is None:
+                from app.api.v1.voice_ws import _map_sarvam_speaker
+                speaker = _map_sarvam_speaker(self.config.get('voice_id'), self.config.get('voice_gender'))
+                speed = float(self.config.get('voice_speed') or 0.95)
+                speed = max(0.5, min(2.0, speed))
+                self.sarvam_tts_conn = WarmSarvamConnection(
+                    api_key=settings.sarvam_api_key or '',
+                    speaker=speaker,
+                    language='hi-IN',
+                    output_audio_codec='pcm_8k',
+                    pace=speed
+                )
+                logger.info('[TTS] Sarvam WS created at 8kHz (lazy init, no resample needed)')
+                await self.sarvam_tts_conn.connect()
+            elif self.sarvam_tts_conn._ws is None or self.sarvam_tts_conn._ws.state != websockets.State.OPEN:
+                await self.sarvam_tts_conn.connect()
+            return self.sarvam_tts_conn
+        else:
+            if self.tts_conn is None:
+                from app.api.v1.voice_ws import _resolve_deepgram_voice
+                dg_voice = _resolve_deepgram_voice(self.config.get('voice_id'), self.config.get('voice_gender'))
+                self.tts_conn = WarmTTSConnection(
+                    api_key=settings.deepgram_api_key or '',
+                    voice_id=dg_voice,
+                    encoding='linear16',
+                    sample_rate=8000
+                )
+                logger.info('[TTS] Deepgram WS created (lazy init)')
+                await self.tts_conn.connect()
+            elif self.tts_conn._ws is None or self.tts_conn._ws.state != websockets.State.OPEN:
+                await self.tts_conn.connect()
+            return self.tts_conn
+
+    async def _stream_tts_pcm_8k(self, text: str, idx: int) -> AsyncGenerator[bytes, None]:
+        """
+        Yields raw 8kHz 16-bit mono PCM chunks as they arrive from the TTS provider.
+        Strips WAV/RIFF headers from any chunk beginning with b'RIFF'.
+        Records time to first TTS byte.
+        """
+        from app.utils.post_processor import apply_hinglish_post_processing
+        v_gender = self.config.get('voice_gender') or self.config.get('voice_id') or 'female'
+        text = apply_hinglish_post_processing(text, v_gender)
+
+        routed_provider = route_tts(
+            text,
+            self.config.get('tts_provider'),
+            self.config.get('language'),
+            self.config.get('voice_id')
+        )
+        logger.info(f'[TTS Stream] chunk #{idx} provider={routed_provider} text="{text[:60]}"')
+        start_t = time.time()
+        first_byte_yielded = False
+        bytes_yielded = 0
+
+        try:
+            conn = await self._get_tts_conn(routed_provider)
+            async for chunk in conn.speak(text):
+                if not chunk:
+                    continue
+                # Strip WAV/RIFF header if chunk starts with RIFF
+                if chunk.startswith(b'RIFF') and b'WAVE' in chunk[:16]:
+                    logger.info('[TTS Stream] Chunk starts with RIFF - stripping WAV header')
+                    data_idx = chunk.find(b'data')
+                    chunk = chunk[data_idx + 8:] if data_idx != -1 else chunk[44:]
+                    if not chunk:
+                        continue
+
+                if not first_byte_yielded:
+                    first_byte_yielded = True
+                    ttfb_ms = int((time.time() - start_t) * 1000)
+                    self.tts_first_byte_time = time.time()
+                    logger.info(f'[TTS Stream] Chunk #{idx} TTFB (first byte): {ttfb_ms}ms')
+
+                bytes_yielded += len(chunk)
+                yield chunk
+        except Exception as e:
+            logger.warning(f'[TTS Stream] Provider {routed_provider} failed ({e}), attempting fallback to Deepgram')
+            if routed_provider != 'deepgram':
+                try:
+                    dg_conn = await self._get_tts_conn('deepgram')
+                    async for chunk in dg_conn.speak(text):
+                        if not chunk:
+                            continue
+                        if chunk.startswith(b'RIFF') and b'WAVE' in chunk[:16]:
+                            data_idx = chunk.find(b'data')
+                            chunk = chunk[data_idx + 8:] if data_idx != -1 else chunk[44:]
+                            if not chunk:
+                                continue
+                        if not first_byte_yielded:
+                            first_byte_yielded = True
+                            self.tts_first_byte_time = time.time()
+                        bytes_yielded += len(chunk)
+                        yield chunk
+                except Exception as dg_err:
+                    logger.error(f'[TTS Stream] Deepgram fallback also failed: {dg_err}')
+                    raise
+            else:
+                raise
+
+            duration_ms = int((time.time() - start_t) * 1000)
+            logger.info(f'[TTS Stream] Chunk #{idx} completed in {duration_ms}ms (yielded {bytes_yielded} bytes)')
+            diagnostics.record_tts_generation(
+                status='success', provider=routed_provider,
+                duration_ms=duration_ms, output_bytes=bytes_yielded, text=text
+            )
+        except Exception as e:
+            logger.error(f'[TTS Stream] Chunk #{idx} error: {e}', exc_info=True)
+            diagnostics.record_tts_generation(
+                status='error', provider=routed_provider,
+                duration_ms=int((time.time() - start_t) * 1000),
+                output_bytes=bytes_yielded, text=text, error_message=str(e)
+            )
+            raise
 
     async def _synthesize_to_pcm_8k(self, text: str, chunk_idx: int) -> bytes:
         """
@@ -435,73 +793,54 @@ class AsteriskVoiceSession:
             )
             logger.info(f'[TTS] chunk #{chunk_idx} provider={routed_provider}')
 
+            pcm_8k = b''
             if routed_provider == 'sarvam':
-                if self.sarvam_tts_conn is None:
-                    from app.api.v1.voice_ws import _map_sarvam_speaker
-                    speaker = _map_sarvam_speaker(self.config.get('voice_id'), self.config.get('voice_gender'))
-                    speed = float(self.config.get('voice_speed') or 0.95)
-                    speed = max(0.5, min(2.0, speed))
-                    # Request 8kHz PCM directly from Sarvam to avoid any local resampling.
-                    # Sarvam's linear16 codec accepts speech_sample_rate=8000, returning
-                    # 8kHz 16-bit mono PCM which is exactly what AudioSocket needs.
-                    self.sarvam_tts_conn = WarmSarvamConnection(
-                        api_key=settings.sarvam_api_key or '',
-                        speaker=speaker,
-                        language='hi-IN',
-                        output_audio_codec='pcm_8k',  # triggers 8kHz request in WarmSarvamConnection
-                        pace=speed
-                    )
-                    logger.info('[TTS] Sarvam WS created at 8kHz (lazy init, no resample needed)')
-                    await self.sarvam_tts_conn.connect()
+                try:
+                    conn = await self._get_tts_conn('sarvam')
+                    logger.info(f'[TTS] Sarvam speak() -> "{text[:80]}"')
+                    raw_chunks: list[bytes] = []
+                    async for audio_chunk in conn.speak(text):
+                        if audio_chunk:
+                            raw_chunks.append(audio_chunk)
 
-                logger.info(f'[TTS] Sarvam speak() -> "{text[:80]}"')
-                raw_chunks: list[bytes] = []
-                async for audio_chunk in self.sarvam_tts_conn.speak(text):
-                    if audio_chunk:
-                        raw_chunks.append(audio_chunk)
+                    if raw_chunks:
+                        pcm_8k = b''.join(raw_chunks)
+                        # Strip WAV header if Sarvam returned WAV instead of raw PCM
+                        if pcm_8k.startswith(b'RIFF') and b'WAVE' in pcm_8k[:16]:
+                            logger.info('[TTS] Sarvam returned WAV - stripping RIFF header')
+                            data_idx = pcm_8k.find(b'data')
+                            pcm_8k = pcm_8k[data_idx + 8:] if data_idx != -1 else pcm_8k[44:]
+                        logger.info(f'[TTS] Sarvam raw 8kHz: bytes={len(pcm_8k)}')
+                    else:
+                        logger.warning(f'[TTS] Sarvam returned zero bytes for chunk #{chunk_idx}, falling back to Deepgram')
+                except Exception as sarvam_err:
+                    logger.warning(f'[TTS] Sarvam synthesis failed ({sarvam_err}), falling back to Deepgram TTS')
+                    pcm_8k = b''
 
-                if not raw_chunks:
-                    logger.warning(f'[TTS] Sarvam returned zero bytes for chunk #{chunk_idx}')
+            if not pcm_8k:
+                # Deepgram streams 8kHz 16-bit linear PCM directly
+                try:
+                    conn = await self._get_tts_conn('deepgram')
+                    logger.info(f'[TTS] Deepgram speak() -> "{text[:80]}"')
+                    dg_chunks: list[bytes] = []
+                    async for audio_chunk in conn.speak(text):
+                        if audio_chunk:
+                            dg_chunks.append(audio_chunk)
+
+                    pcm_8k = b''.join(dg_chunks)
+                    logger.info(f'[TTS] Deepgram raw: bytes={len(pcm_8k)}')
+                except Exception as dg_err:
+                    logger.error(f'[TTS] Deepgram fallback failed: {dg_err}')
                     return b''
 
-                pcm_8k = b''.join(raw_chunks)
-                logger.info(
-                    f'[TTS] Sarvam raw 8kHz: bytes={len(pcm_8k)}, '
-                    f'first32={pcm_8k[:32].hex()}'
-                )
-
-                # Strip WAV header if Sarvam returned WAV instead of raw PCM
-                if pcm_8k.startswith(b'RIFF') and b'WAVE' in pcm_8k[:16]:
-                    logger.info('[TTS] Sarvam returned WAV - stripping RIFF header')
-                    data_idx = pcm_8k.find(b'data')
-                    pcm_8k = pcm_8k[data_idx + 8:] if data_idx != -1 else pcm_8k[44:]
-
-                # No resampling needed: Sarvam returned 8kHz PCM directly
-
-            else:
-                # Deepgram streams 8kHz 16-bit linear PCM directly
-                if self.tts_conn is None:
-                    from app.api.v1.voice_ws import _resolve_deepgram_voice
-                    dg_voice = _resolve_deepgram_voice(self.config.get('voice_id'), self.config.get('voice_gender'))
-                    self.tts_conn = WarmTTSConnection(
-                        api_key=settings.deepgram_api_key or '',
-                        voice_id=dg_voice,
-                        encoding='linear16',
-                        sample_rate=8000
-                    )
-                    logger.info('[TTS] Deepgram WS created (lazy init)')
-                    await self.tts_conn.connect()
-
-                logger.info(f'[TTS] Deepgram speak() -> "{text[:80]}"')
-                dg_chunks: list[bytes] = []
-                async for audio_chunk in self.tts_conn.speak(text):
-                    if audio_chunk:
-                        dg_chunks.append(audio_chunk)
-
-                pcm_8k = b''.join(dg_chunks)
-                logger.info(f'[TTS] Deepgram raw: bytes={len(pcm_8k)}, first32={pcm_8k[:32].hex()}')
-
             ms = int((time.time() - start) * 1000)
+            if self.diag:
+                self.diag.tts_started = True
+                self.diag.tts_completed = True
+                self.diag.tts_output_bytes = len(pcm_8k)
+                self.diag.pcm_output_bytes = len(pcm_8k)
+                if self.diag.t_first_tts_audio_ms is None:
+                    self.diag.t_first_tts_audio_ms = (time.monotonic() - self.diag.t_start) * 1000
             logger.info(
                 f'[TTS] chunk #{chunk_idx} synthesized in {ms}ms, pcm_8k_bytes={len(pcm_8k)}, '
                 f'rate=8000, mono=True, sample_width=2'
@@ -585,18 +924,39 @@ class AsteriskVoiceSession:
                 self.greeting_protected = False
             return
 
-        def _insert_assist_msg(seq: int, response_text: str, model_name: str):
-            """DB write - runs in a thread, all args passed explicitly."""
+        pipeline_started_at_iso = datetime.now(timezone.utc).isoformat()
+
+        def _insert_assist_msg(
+            seq: int,
+            response_text: str,
+            model_name: str,
+            started_at_iso: str,
+            llm_first_token_ms: Optional[int] = None,
+            tts_first_byte_ms: Optional[int] = None,
+            first_audio_ms: Optional[int] = None,
+            total_playback_ms: Optional[int] = None
+        ):
+            """DB write - runs in a thread, records start time at pipeline trigger and turn latency metrics."""
             try:
                 db = get_supabase_client()
-                db.table('call_messages').insert({
+                payload = {
                     'call_id': self.call_uuid,
                     'role': 'assistant',
                     'content': response_text,
                     'sequence_number': seq,
-                    'started_at': datetime.now(timezone.utc).isoformat(),
+                    'started_at': started_at_iso,
                     'model_used': model_name
-                }).execute()
+                }
+                if llm_first_token_ms is not None:
+                    payload['llm_first_token_ms'] = llm_first_token_ms
+                if tts_first_byte_ms is not None:
+                    payload['tts_first_byte_ms'] = tts_first_byte_ms
+                if first_audio_ms is not None:
+                    payload['first_audio_ms'] = first_audio_ms
+                if total_playback_ms is not None:
+                    payload['total_playback_ms'] = total_playback_ms
+
+                db.table('call_messages').insert(payload).execute()
             except Exception as db_err:
                 logger.error(f'[Pipeline] Failed to persist assistant message: {db_err}')
 
@@ -655,16 +1015,19 @@ class AsteriskVoiceSession:
                         f'  FULL_AUDIO_DURATION_MS={duration_ms}'
                     )
 
-                    import wave
-                    try:
-                        with wave.open('debug_full_response.wav', 'wb') as wav_file:
-                            wav_file.setnchannels(1)
-                            wav_file.setsampwidth(2)
-                            wav_file.setframerate(8000)
-                            wav_file.writeframes(pcm_8k)
-                        logger.info('[Pipeline] Saved WAV to debug_full_response.wav')
-                    except Exception as wav_err:
-                        logger.error(f'Failed to save WAV: {wav_err}')
+                    if getattr(settings, 'SAVE_DEBUG_WAV', False):
+                        def _dump_wav_async(data: bytes):
+                            import wave
+                            try:
+                                with wave.open('debug_full_response.wav', 'wb') as wav_file:
+                                    wav_file.setnchannels(1)
+                                    wav_file.setsampwidth(2)
+                                    wav_file.setframerate(8000)
+                                    wav_file.writeframes(data)
+                                logger.info('[Pipeline] Saved WAV to debug_full_response.wav')
+                            except Exception as wav_err:
+                                logger.error(f'Failed to save WAV: {wav_err}')
+                        asyncio.create_task(asyncio.to_thread(_dump_wav_async, pcm_8k))
 
                     offset = 0
                     frame_count = 0
@@ -696,11 +1059,12 @@ class AsteriskVoiceSession:
                         packet = bytes([0x10]) + len(chunk).to_bytes(2, 'big') + chunk
                         async with self._writer_lock:
                             self.writer.write(packet)
-                            try:
-                                await self.writer.drain()
-                            except Exception as e:
-                                logger.error(f'[AudioSocket] Drain error in flat playback: {e}')
-                                break
+                            if frame_count % 10 == 0 or offset >= pcm_bytes:
+                                try:
+                                    await self.writer.drain()
+                                except Exception as e:
+                                    logger.error(f'[AudioSocket] Drain error in flat playback: {e}')
+                                    break
 
                         next_send_time += 0.02
                         remaining = next_send_time - time.monotonic()
@@ -721,9 +1085,30 @@ class AsteriskVoiceSession:
                 self.messages.append({'role': 'assistant', 'content': full_response})
                 elapsed = int((time.time() - pipeline_start) * 1000)
                 logger.info(f'[Pipeline] COMPLETED {pipeline_type.upper()} in {elapsed}ms for call {self.call_uuid}')
+
+                commit_delay_ms = int((pipeline_start - self.t_speech_final) * 1000) if self.t_speech_final > 0 else 0
+                llm_tok_ms = int((llm_first_token_time - pipeline_start) * 1000) if llm_first_token_time else None
+                first_sent_ms = int((first_sentence_ready_time - pipeline_start) * 1000) if first_sentence_ready_time else None
+                tts_byte_ms = int((getattr(self, 'tts_first_byte_time', 0.0) - pipeline_start) * 1000) if getattr(self, 'tts_first_byte_time', 0.0) > 0 else None
+                first_aud_ms = int((getattr(self, 'first_audio_frame_time', 0.0) - pipeline_start) * 1000) if getattr(self, 'first_audio_frame_time', 0.0) > 0 else None
+                playback_dur_ms = int((time.time() - getattr(self, 'first_audio_frame_time', pipeline_start)) * 1000)
+
+                latency_turn = {
+                    "event": "latency_turn",
+                    "call_uuid": self.call_uuid,
+                    "turn_id": assistant_seq,
+                    "commit_delay_ms": commit_delay_ms,
+                    "llm_first_token_ms": llm_tok_ms,
+                    "first_sentence_ms": first_sent_ms,
+                    "tts_first_byte_ms": tts_byte_ms,
+                    "first_audio_ms": first_aud_ms,
+                    "playback_ms": playback_dur_ms,
+                    "total_turn_ms": elapsed
+                }
+                logger.info(f"[LatencyTurn] {json.dumps(latency_turn)}")
                 try:
                     asyncio.create_task(
-                        asyncio.to_thread(_insert_assist_msg, assistant_seq, full_response, model)
+                        asyncio.to_thread(_insert_assist_msg, assistant_seq, full_response, model, pipeline_started_at_iso, llm_tok_ms if "llm_tok_ms" in locals() else None, tts_byte_ms if "tts_byte_ms" in locals() else None, first_aud_ms if "first_aud_ms" in locals() else None, playback_dur_ms if "playback_dur_ms" in locals() else None)
                     )
                 except Exception as e:
                     logger.error(f'Failed to schedule assistant message DB write: {e}')
@@ -733,48 +1118,25 @@ class AsteriskVoiceSession:
                 logger.info(f'[Pipeline] MODE_USED=STREAMING_TTS for call {self.call_uuid}')
                 token_queue = asyncio.Queue()
                 sentence_queue = asyncio.Queue()
+                tts_done = asyncio.Event()
 
                 # Shared State Variables
                 full_response = ''
                 first_token_logged = False
                 llm_first_token_time = None
+                first_sentence_ready_time = None
                 is_first_chunk = True
                 max_built_idx = -1
-
-                sentences_tts_started = 0
                 sentences_tts_finished = 0
 
                 playback_buffer = bytearray()
                 playback_offset = 0
-
-                # Dictionary mapping sentence_idx -> synthesized PCM bytes
-                synthesized_audio = {}
-
-                # Metrics timestamps
-                sentence_ready_time = {}
-                tts_start_time = {}
-                tts_finish_time = {}
-                sentence_played_time = {}
 
                 # Protected / Conjunction Words
                 PROTECTED_WORDS = {
                     "hai", "hoon", "ka", "ki", "ke", "ko", "se", "aur", "lekin", "because", 
                     "that", "to", "of", "raha", "rahi", "kyunki"
                 }
-
-                # Greetings list to prevent greeting-only first chunk
-                GREETING_WORDS = {
-                    "hello", "hi", "hey", "namaste", "namaskar", "satsriakal", "pranam", "adaab", "ola", "halo", 
-                    "kaise", "ho", "aap", "tum", "kya", "haal", "hai", "sab", "theek", "ji", "haanji", "haan", 
-                    "good", "morning", "afternoon", "evening", "welcome", "swagat"
-                }
-
-                def is_only_greeting(text: str) -> bool:
-                    clean_text = re.sub(r'[^\w\s\u0900-\u097F]', ' ', text).lower()
-                    words_list = clean_text.split()
-                    if not words_list:
-                        return True
-                    return all(w in GREETING_WORDS for w in words_list)
 
                 def ends_with_sentence_punc(word: str) -> bool:
                     return len(word) > 0 and word[-1] in ('.', '?', '!', '\u0964')
@@ -785,8 +1147,7 @@ class AsteriskVoiceSession:
                 def is_protected_word(word: str) -> bool:
                     return word.lower().strip(".,?!:;।") in PROTECTED_WORDS
 
-                # Sentence Builder release check
-                def should_release(words_list: list[str], is_first_chunk: bool) -> bool:
+                def should_release(words_list: list[str], is_first: bool) -> bool:
                     num_words = len(words_list)
                     if num_words == 0:
                         return False
@@ -797,17 +1158,17 @@ class AsteriskVoiceSession:
                     if ends_with_sentence_punc(last_word):
                         return True
 
-                    # Fast First Chunk: release at pause punctuation after 4 words, or 8 words total
-                    if is_first_chunk:
-                        if ends_with_pause_punc(last_word) and num_words >= 4:
+                    # Fast First Chunk: release at pause punctuation after >= 4 words, or >= 6 words total
+                    if is_first:
+                        if ends_with_pause_punc(last_word) and num_words >= voice_cfg.TTS_CHUNK_FIRST_WORD_MIN:
                             return True
-                        if num_words >= 8 and not is_protected_word(last_word):
+                        if num_words >= voice_cfg.TTS_CHUNK_FIRST_WORD_MAX and not is_protected_word(last_word):
                             return True
                     else:
-                        # Subsequent chunks: release at pause punctuation after 8 words, or 16 words max
-                        if ends_with_pause_punc(last_word) and num_words >= 8 and not is_protected_word(last_word):
+                        # Subsequent chunks: release at pause punctuation after >= 8 words, or 16 words max
+                        if ends_with_pause_punc(last_word) and num_words >= voice_cfg.TTS_CHUNK_WORD_MIN and not is_protected_word(last_word):
                             return True
-                        if num_words >= 16 and not is_protected_word(last_word):
+                        if num_words >= (voice_cfg.TTS_CHUNK_WORD_MIN * 2) and not is_protected_word(last_word):
                             return True
 
                     return False
@@ -833,122 +1194,140 @@ class AsteriskVoiceSession:
                                 logger.info(f'[Pipeline] LLM First Token Time: {int((llm_first_token_time - pipeline_start) * 1000)}ms')
 
                             full_response += token
-                            if not settings.DISABLE_STREAMING_TTS:
-                                await token_queue.put(token)
-
-                        if settings.DISABLE_STREAMING_TTS and not self.barge_in_event.is_set():
-                            await token_queue.put(full_response)
+                            await token_queue.put(token)
                     finally:
                         await token_queue.put(None)
 
                 # 2. Sentence Builder Task
                 async def speech_chunker():
-                    nonlocal is_first_chunk, max_built_idx
+                    nonlocal is_first_chunk, max_built_idx, first_sentence_ready_time
                     words_list = []
                     token_buffer = ""
                     sentence_idx = 0
+                    first_token_arrival = None
 
-                    while True:
-                        token = await token_queue.get()
-                        if token is None:
-                            break
+                    try:
+                        while True:
+                            # Apply TTS_CHUNK_TIMEOUT_MS (300ms) for the FIRST chunk only
+                            timeout = None
+                            if is_first_chunk and first_token_arrival and len(words_list) >= 3:
+                                elapsed_since_first = time.time() - first_token_arrival
+                                remaining = (voice_cfg.TTS_CHUNK_TIMEOUT_MS / 1000.0) - elapsed_since_first
+                                timeout = max(0.01, remaining)
 
-                        token_buffer += token
-                        temp_words = token_buffer.split()
-                        if not token.endswith(' ') and temp_words:
-                            completed_words = temp_words[:-1]
-                            token_buffer = temp_words[-1]
-                        else:
-                            completed_words = temp_words
-                            token_buffer = ''
+                            try:
+                                if timeout is not None:
+                                    token = await asyncio.wait_for(token_queue.get(), timeout=timeout)
+                                else:
+                                    token = await token_queue.get()
+                            except asyncio.TimeoutError:
+                                # Timeout triggered for first chunk: force release buffered words
+                                if words_list and is_first_chunk:
+                                    chunk_text = ' '.join(words_list)
+                                    if not first_sentence_ready_time:
+                                        first_sentence_ready_time = time.time()
+                                    logger.info(f"[Pipeline] First chunk timeout release ({len(words_list)} words): '{chunk_text}'")
+                                    await sentence_queue.put((sentence_idx, chunk_text))
+                                    max_built_idx = sentence_idx
+                                    sentence_idx += 1
+                                    words_list = []
+                                    is_first_chunk = False
+                                continue
 
-                        for word in completed_words:
-                            words_list.append(word)
+                            if token is None:
+                                break
 
-                            if should_release(words_list, is_first_chunk):
-                                chunk_text = ' '.join(words_list)
-                                sentence_ready_time[sentence_idx] = time.time()
-                                logger.info(f"[Pipeline] Sentence {sentence_idx} Ready: '{chunk_text[:50]}'")
+                            if first_token_arrival is None:
+                                first_token_arrival = time.time()
 
+                            token_buffer += token
+                            temp_words = token_buffer.split()
+                            if not token.endswith(' ') and temp_words:
+                                completed_words = temp_words[:-1]
+                                token_buffer = temp_words[-1]
+                            else:
+                                completed_words = temp_words
+                                token_buffer = ''
+
+                            for word in completed_words:
+                                words_list.append(word)
+
+                                if should_release(words_list, is_first_chunk):
+                                    chunk_text = ' '.join(words_list)
+                                    if not first_sentence_ready_time:
+                                        first_sentence_ready_time = time.time()
+                                    logger.info(f"[Pipeline] Sentence {sentence_idx} Ready: '{chunk_text[:50]}'")
+
+                                    await sentence_queue.put((sentence_idx, chunk_text))
+                                    max_built_idx = sentence_idx
+
+                                    sentence_idx += 1
+                                    words_list = []
+                                    is_first_chunk = False
+
+                        if token_buffer.strip():
+                            words_list.append(token_buffer.strip())
+
+                        if words_list:
+                            chunk_text = ' '.join(words_list)
+                            if chunk_text.strip():
+                                if not first_sentence_ready_time:
+                                    first_sentence_ready_time = time.time()
+                                logger.info(f"[Pipeline] Sentence {sentence_idx} Ready (Flush): '{chunk_text[:50]}'")
                                 await sentence_queue.put((sentence_idx, chunk_text))
                                 max_built_idx = sentence_idx
-
                                 sentence_idx += 1
-                                words_list = []
-                                is_first_chunk = False
+                    finally:
+                        await sentence_queue.put(None)
 
-                    if token_buffer.strip():
-                        words_list.append(token_buffer.strip())
+                # 3. Single TTS Worker Task
+                async def tts_worker():
+                    nonlocal sentences_tts_finished
+                    try:
+                        while True:
+                            item = await sentence_queue.get()
+                            if item is None:
+                                break
 
-                    if words_list:
-                        chunk_text = ' '.join(words_list)
-                        if chunk_text.strip():
-                            sentence_ready_time[sentence_idx] = time.time()
-                            logger.info(f"[Pipeline] Sentence {sentence_idx} Ready (Flush): '{chunk_text[:50]}'")
-                            await sentence_queue.put((sentence_idx, chunk_text))
-                            max_built_idx = sentence_idx
-                            sentence_idx += 1
+                            idx, text = item
+                            if self.generation_id != current_gen or self.barge_in_event.is_set():
+                                continue
 
-                    await sentence_queue.put(None)
+                            clean_text = sanitize_text_for_tts(text)
+                            if not clean_text:
+                                continue
 
-                # 3. TTS Worker Pool Task
-                async def tts_worker(worker_id: int):
-                    nonlocal sentences_tts_started, sentences_tts_finished
-                    while True:
-                        item = await sentence_queue.get()
-                        if item is None:
-                            await sentence_queue.put(None)
-                            break
+                            # High Water Mark buffering protection (> 3s audio buffered = 48000 bytes)
+                            while len(playback_buffer) - playback_offset > 48000 and not self.barge_in_event.is_set() and self.generation_id == current_gen:
+                                await asyncio.sleep(0.05)
 
-                        idx, text = item
+                            if self.generation_id != current_gen or self.barge_in_event.is_set():
+                                continue
 
-                        tts_start_time[idx] = time.time()
-                        wait_time_ms = int((tts_start_time[idx] - sentence_ready_time[idx]) * 1000)
-                        logger.info(f"[Pipeline] Sentence {idx} TTS Start (Worker {worker_id}) [TTS Queue Wait Time: {wait_time_ms}ms]")
-                        sentences_tts_started += 1
-
-                        # High Water Mark buffering protection (> 3 seconds worth of audio)
-                        while len(playback_buffer) - playback_offset > 48000 and not self.barge_in_event.is_set():
-                            await asyncio.sleep(0.1)
-
-                        clean_text = sanitize_text_for_tts(text)
-                        if self.generation_id != current_gen or self.barge_in_event.is_set():
-                            logger.info(f"[Pipeline] Discarding stale TTS chunk #{idx} (gen mismatch)")
-                            continue
-                        pcm_8k = await self._synthesize_to_pcm_8k(clean_text, idx)
-
-                        tts_finish_time[idx] = time.time()
-                        duration_ms = int((tts_finish_time[idx] - tts_start_time[idx]) * 1000)
-                        logger.info(f"[Pipeline] Sentence {idx} TTS Finish in {duration_ms}ms (Worker {worker_id})")
-
-                        sentences_tts_finished += 1
-                        synthesized_audio[idx] = pcm_8k
+                            try:
+                                async for pcm_chunk in self._stream_tts_pcm_8k(clean_text, idx):
+                                    if self.generation_id != current_gen or self.barge_in_event.is_set():
+                                        logger.info(f"[Pipeline] Aborting TTS stream chunk #{idx} due to gen mismatch or barge-in")
+                                        break
+                                    playback_buffer.extend(pcm_chunk)
+                                sentences_tts_finished += 1
+                            except Exception as tts_err:
+                                logger.error(f"[Pipeline] TTS error on sentence #{idx} ('{clean_text[:30]}'): {tts_err}")
+                                continue
+                    finally:
+                        tts_done.set()
 
                 # 4. Playback Task
                 async def playback_worker():
                     nonlocal playback_offset, playback_buffer
 
-                    # 200ms fast-start prebuffer (3,200 bytes) instead of 800ms stall
-                    prebuffer_bytes = int(8000 * 2 * 0.20)
-                    next_playback_idx = 0
+                    # 200ms fast-start prebuffer (voice_cfg.TTS_PREBUFFER_MS)
+                    prebuffer_bytes = int(8000 * 2 * (voice_cfg.TTS_PREBUFFER_MS / 1000.0))
 
-                    while not self.barge_in_event.is_set():
-                        if next_playback_idx in synthesized_audio:
-                            pcm = synthesized_audio[next_playback_idx]
-                            if next_playback_idx not in sentence_played_time:
-                                sentence_played_time[next_playback_idx] = time.time()
-                            playback_buffer.extend(pcm)
-                            del synthesized_audio[next_playback_idx]
-                            next_playback_idx += 1
-
+                    # Prebuffer phase
+                    while not self.barge_in_event.is_set() and self.generation_id == current_gen:
                         buffered_available = len(playback_buffer) - playback_offset
-                        accumulator_done = (
-                            sentence_queue.empty() 
-                            and next_playback_idx > max_built_idx
-                            and not synthesized_audio
-                        )
-
-                        if buffered_available >= prebuffer_bytes or accumulator_done:
+                        if buffered_available >= prebuffer_bytes or tts_done.is_set():
                             logger.info(f"[Pipeline] Playback Start [Buffer: {buffered_available} bytes (~{int(buffered_available/16)}ms)]")
                             break
                         await asyncio.sleep(0.01)
@@ -960,28 +1339,11 @@ class AsteriskVoiceSession:
                     was_in_underflow = False
                     first_frame_logged = False
 
-                    while not self.barge_in_event.is_set():
-                        if self.generation_id != current_gen:
-                            logger.info(f"[Pipeline] Playback worker aborted: generation mismatch ({self.generation_id} != {current_gen})")
-                            break
-
-                        while next_playback_idx in synthesized_audio:
-                            pcm = synthesized_audio[next_playback_idx]
-                            if next_playback_idx not in sentence_played_time:
-                                sentence_played_time[next_playback_idx] = time.time()
-                            playback_buffer.extend(pcm)
-                            del synthesized_audio[next_playback_idx]
-                            next_playback_idx += 1
-
+                    while not self.barge_in_event.is_set() and self.generation_id == current_gen:
                         buffered_available = len(playback_buffer) - playback_offset
-                        accumulator_done = (
-                            sentence_queue.empty() 
-                            and next_playback_idx > max_built_idx
-                            and not synthesized_audio
-                        )
 
                         if buffered_available < 320:
-                            if accumulator_done:
+                            if tts_done.is_set():
                                 logger.info(f"[Pipeline] Playback complete for call {self.call_uuid}")
                                 break
 
@@ -1014,7 +1376,8 @@ class AsteriskVoiceSession:
 
                         if not first_frame_logged:
                             first_frame_logged = True
-                            first_audio_ms = int((time.time() - pipeline_start) * 1000)
+                            self.first_audio_frame_time = time.time()
+                            first_audio_ms = int((self.first_audio_frame_time - pipeline_start) * 1000)
                             logger.info(f"[Pipeline] First audio frame played at {first_audio_ms}ms for call {self.call_uuid}")
 
                         if self.writer.is_closing():
@@ -1033,6 +1396,11 @@ class AsteriskVoiceSession:
                                 logger.error(f'[AudioSocket] Drain error in playback_pacer: {e}')
                                 break
 
+                        # Periodically trim playback_buffer to avoid unbounded growth
+                        if playback_offset > 65536:
+                            del playback_buffer[:playback_offset]
+                            playback_offset = 0
+
                         # Absolute-deadline pacing with desync recovery
                         next_deadline += 0.020
                         now = time.monotonic()
@@ -1043,54 +1411,75 @@ class AsteriskVoiceSession:
                         elif behind < 0:
                             await asyncio.sleep(-behind)
 
-                # 5. Pipeline Visualization Task
+                # 5. Pipeline Visualization Task (opt-in)
                 async def pipeline_visualizer():
                     nonlocal playback_offset, playback_buffer
                     start_viz = time.time()
                     while not self.barge_in_event.is_set() and not playback_task.done():
                         await asyncio.sleep(0.2)
                         elapsed = time.time() - start_viz
-
-                        llm_bar = "█" * min(20, int(len(full_response) / 5))
-                        sb_bar = "█" * min(20, max_built_idx + 1)
-                        tts_bar = "█" * min(20, sentences_tts_finished)
-
                         buf_bytes = len(playback_buffer) - playback_offset
                         buf_ms = int(buf_bytes / 16)
-                        buf_bar = "█" * min(20, int(buf_ms / 100))
-
-                        play_bar = "█" * min(20, int(playback_offset / 1600))
-
-                        tok_q_size = token_queue.qsize()
-                        sent_q_size = sentence_queue.qsize()
-
                         logger.info(
                             f"\n--- Pipeline Visualization ({elapsed:.1f}s) ---\n"
-                            f"LLM (Tokens):       {len(full_response):<4} {llm_bar} (Queue Depth: {tok_q_size})\n"
-                            f"Sentence Builder:   {max_built_idx + 1:<4} {sb_bar} (Queue Depth: {sent_q_size})\n"
-                            f"TTS Finished:       {sentences_tts_finished:<4} {tts_bar}\n"
-                            f"Playback Buffer:    {buf_ms:<4}ms {buf_bar}\n"
-                            f"Playback Offset:    {playback_offset:<4} bytes {play_bar}\n"
+                            f"LLM (Tokens):       {len(full_response):<4}\n"
+                            f"TTS Finished:       {sentences_tts_finished:<4}\n"
+                            f"Playback Buffer:    {buf_ms:<4}ms\n"
+                            f"Playback Offset:    {playback_offset:<4} bytes\n"
                             f"----------------------------------------"
                         )
 
                 # Start concurrent workers
                 reader_task = asyncio.create_task(llm_reader())
                 chunker_task = asyncio.create_task(speech_chunker())
-                tts_w1 = asyncio.create_task(tts_worker(worker_id=1))
-                tts_w2 = asyncio.create_task(tts_worker(worker_id=2))
+                tts_task = asyncio.create_task(tts_worker())
                 playback_task = asyncio.create_task(playback_worker())
-                visualizer_task = asyncio.create_task(pipeline_visualizer())
+                visualizer_task = None
+                if getattr(settings, 'PIPELINE_VISUALIZER_ENABLED', False):
+                    visualizer_task = asyncio.create_task(pipeline_visualizer())
 
-                self.tts_tasks = [reader_task, chunker_task, tts_w1, tts_w2, playback_task, visualizer_task]
+                self.tts_tasks = [reader_task, chunker_task, tts_task, playback_task]
+                if visualizer_task:
+                    self.tts_tasks.append(visualizer_task)
 
-                await asyncio.gather(reader_task, chunker_task, tts_w1, tts_w2, playback_task)
-                if not visualizer_task.done():
-                    visualizer_task.cancel()
+                try:
+                    await asyncio.gather(reader_task, chunker_task, tts_task, playback_task)
+                except Exception as e:
+                    logger.error(f"[Pipeline] Exception in streaming pipeline tasks: {e}", exc_info=True)
+                finally:
+                    tts_done.set()
+                    if visualizer_task and not visualizer_task.done():
+                        visualizer_task.cancel()
+                    for t in self.tts_tasks:
+                        if not t.done():
+                            t.cancel()
+                    self.tts_tasks = []
+
                 self.set_state('idle')
                 self.messages.append({'role': 'assistant', 'content': full_response})
                 elapsed = int((time.time() - pipeline_start) * 1000)
                 logger.info(f'[Pipeline] COMPLETED {pipeline_type.upper()} in {elapsed}ms for call {self.call_uuid}')
+
+                commit_delay_ms = int((pipeline_start - self.t_speech_final) * 1000) if self.t_speech_final > 0 else 0
+                llm_tok_ms = int((llm_first_token_time - pipeline_start) * 1000) if llm_first_token_time else None
+                first_sent_ms = int((first_sentence_ready_time - pipeline_start) * 1000) if first_sentence_ready_time else None
+                tts_byte_ms = int((getattr(self, 'tts_first_byte_time', 0.0) - pipeline_start) * 1000) if getattr(self, 'tts_first_byte_time', 0.0) > 0 else None
+                first_aud_ms = int((getattr(self, 'first_audio_frame_time', 0.0) - pipeline_start) * 1000) if getattr(self, 'first_audio_frame_time', 0.0) > 0 else None
+                playback_dur_ms = int((time.time() - getattr(self, 'first_audio_frame_time', pipeline_start)) * 1000)
+
+                latency_turn = {
+                    "event": "latency_turn",
+                    "call_uuid": self.call_uuid,
+                    "turn_id": assistant_seq,
+                    "commit_delay_ms": commit_delay_ms,
+                    "llm_first_token_ms": llm_tok_ms,
+                    "first_sentence_ms": first_sent_ms,
+                    "tts_first_byte_ms": tts_byte_ms,
+                    "first_audio_ms": first_aud_ms,
+                    "playback_ms": playback_dur_ms,
+                    "total_turn_ms": elapsed
+                }
+                logger.info(f"[LatencyTurn] {json.dumps(latency_turn)}")
 
                 turn_timeline = {
                     "event": "turn_timeline",
@@ -1113,7 +1502,7 @@ class AsteriskVoiceSession:
 
                 try:
                     asyncio.create_task(
-                        asyncio.to_thread(_insert_assist_msg, assistant_seq, full_response, model)
+                        asyncio.to_thread(_insert_assist_msg, assistant_seq, full_response, model, pipeline_started_at_iso, llm_tok_ms if "llm_tok_ms" in locals() else None, tts_byte_ms if "tts_byte_ms" in locals() else None, first_aud_ms if "first_aud_ms" in locals() else None, playback_dur_ms if "playback_dur_ms" in locals() else None)
                     )
                 except Exception as e:
                     logger.error(f'Failed to schedule assistant message DB write: {e}')
@@ -1147,22 +1536,9 @@ class AsteriskVoiceSession:
                 endpointing=voice_cfg.STT_ENDPOINTING_MS,
                 model=voice_cfg.STT_MODEL,
                 encoding='linear16',
-                sample_rate='8000'
+                sample_rate='8000',
+                utterance_end_ms=voice_cfg.STT_UTTERANCE_END_MS,
             ):
-                # Backchannels list: acknowledgments that should NOT interrupt bot speech
-                BACKCHANNELS = {
-                    "haan", "hanji", "haanji", "hmm", "hm", "ok", "okay", "theek", "theek hai",
-                    "achha", "achha ji", "sahi", "sahi hai", "yes", "yeah", "yep", "right",
-                    "हाँ", "हाँजी", "हूँ", "ठीक", "अच्छा"
-                }
-
-                # Trailing connectors indicating incomplete thought / clause
-                TRAILING_CONNECTORS = {
-                    "का", "की", "के", "में", "से", "और", "या", "तो", "लेकिन", "कि", "भी", "पर", "क्योंकि", "मतलब", "अगर",
-                    "aur", "ya", "ki", "ka", "ke", "ko", "se", "me", "mein", "par", "lekin", "to", "kyunki", "matlab", "agar",
-                    "and", "or", "of", "for", "with", "because", "but", "if"
-                }
-
                 if event_type == EVT_SPEECH_STARTED:
                     if self.turn_commit_task and not self.turn_commit_task.done():
                         self.turn_commit_task.cancel()
@@ -1172,23 +1548,34 @@ class AsteriskVoiceSession:
                     continue
 
                 elif event_type in (EVT_INTERIM, EVT_FINAL, EVT_SPEECH_FINAL):
-                    if self.greeting_active:
-                        continue
-
                     transcript = payload.get('transcript', '').strip()
-                    if not transcript:
-                        continue
-
-                    clean_text = re.sub(r'[^\w\s\u0900-\u097F]', '', transcript).strip()
+                    clean_text = re.sub(r'[^\w\s\u0900-\u097F]', '', transcript).strip() if transcript else ""
                     if not clean_text:
                         continue
 
-                    words = clean_text.split()
+                    logger.info(f"[STT] Event {event_type}: '{transcript}' (speaking={self.is_speaking()}, greeting_active={self.greeting_active})")
 
                     # 1. BARGE-IN (When bot is actively speaking)
                     if self.is_speaking():
+                        if not clean_text:
+                            continue
+
+                        # Guard initial greeting against early line connect clicks and noise in first 1.5s
+                        if getattr(self, "greeting_protected", False):
+                            elapsed_speaking = time.time() - self.speaking_started_at
+                            if elapsed_speaking < 1.5:
+                                logger.debug(
+                                    f'[Barge-In] Greeting protected (elapsed={elapsed_speaking:.2f}s), '
+                                    f'suppressing early line audio: "{transcript}"'
+                                )
+                                continue
+                            else:
+                                self.greeting_protected = False
+
+                        words = clean_text.split()
+
                         # A. Backchannel check: if caller is merely acknowledging, do not interrupt
-                        is_backchannel = len(words) <= 2 and all(w.lower() in BACKCHANNELS for w in words)
+                        is_backchannel = len(words) <= 2 and all(w.lower() in self.BACKCHANNELS for w in words)
                         if is_backchannel:
                             logger.info(f'[Barge-In] Suppressed backchannel acknowledgment during speech: "{transcript}"')
                             continue
@@ -1227,7 +1614,7 @@ class AsteriskVoiceSession:
 
                     # 2. TURN DETECTION STATE MACHINE (When bot is listening / idle)
                     if event_type == EVT_INTERIM:
-                        # Cancel any pending turn commit because caller is still actively uttering words
+                        # Cancel pending commit because caller is still actively uttering words
                         if self.turn_commit_task and not self.turn_commit_task.done():
                             self.turn_commit_task.cancel()
                             self.turn_commit_task = None
@@ -1235,6 +1622,16 @@ class AsteriskVoiceSession:
                         self.turn_state = 'LISTENING'
 
                     elif event_type in (EVT_SPEECH_FINAL, EVT_FINAL):
+                        if event_type == EVT_SPEECH_FINAL:
+                            self.t_speech_final = time.time()
+
+                        # If transcript is empty:
+                        if not clean_text:
+                            if event_type == EVT_SPEECH_FINAL and self.accumulated_transcript.strip():
+                                logger.info("[TurnSM] Empty transcript on SPEECH_FINAL with non-empty accumulator -> immediate commit")
+                                self._schedule_commit(0.0)
+                            continue
+
                         self.turn_state = 'POSSIBLE_END'
                         if self.accumulated_transcript:
                             self.accumulated_transcript += " " + clean_text
@@ -1242,50 +1639,29 @@ class AsteriskVoiceSession:
                             self.accumulated_transcript = clean_text
                             self.first_final_time = time.time()
 
-                        acc_words = self.accumulated_transcript.split()
-                        last_w = acc_words[-1].lower() if acc_words else ""
-                        ends_punc = len(transcript) > 0 and transcript[-1] in ('.', '?', '!', '।')
-
-                        # Adaptive wait time calculation
-                        if last_w in TRAILING_CONNECTORS:
-                            adaptive_wait = 0.70  # 700ms wait for trailing clause continuation
-                            logger.info(f"[TurnSM] Trailing connector '{last_w}' detected, pausing 700ms: '{self.accumulated_transcript}'")
-                        elif ends_punc:
-                            adaptive_wait = 0.25  # 250ms fast commit on complete sentence
-                        else:
-                            adaptive_wait = 0.45  # 450ms standard conversational pause
-
                         # Hard cap: max 1.2s wait after first final
                         if time.time() - self.first_final_time >= 1.2:
-                            adaptive_wait = 0.0
+                            logger.info("[TurnSM] Hard cap (1.2s) reached since first final -> immediate commit")
+                            self._schedule_commit(0.0)
+                        elif event_type == EVT_SPEECH_FINAL:
+                            acc_words = self.accumulated_transcript.split()
+                            last_w = acc_words[-1].lower() if acc_words else ""
+                            if last_w in self.TRAILING_CONNECTORS:
+                                wait_s = voice_cfg.TURN_COMMIT_CONNECTOR_WAIT_MS / 1000.0
+                                logger.info(f"[TurnSM] Trailing connector '{last_w}' on SPEECH_FINAL, pausing {int(wait_s*1000)}ms")
+                                self._schedule_commit(wait_s)
+                            else:
+                                logger.info("[TurnSM] SPEECH_FINAL on complete utterance -> immediate commit")
+                                self._schedule_commit(0.0)
+                        elif event_type == EVT_FINAL:
+                            safety_wait = voice_cfg.TURN_COMMIT_SAFETY_NET_MS / 1000.0
+                            logger.info(f"[TurnSM] EVT_FINAL received, scheduling safety net commit in {int(safety_wait*1000)}ms")
+                            self._schedule_commit(safety_wait)
 
-                        if self.turn_commit_task and not self.turn_commit_task.done():
-                            self.turn_commit_task.cancel()
-
-                        candidate_text = self.accumulated_transcript
-
-                        async def _do_commit_turn(wait_s: float, text_to_commit: str):
-                            try:
-                                if wait_s > 0:
-                                    await asyncio.sleep(wait_s)
-                                self.turn_state = 'COMMITTED'
-                                self.accumulated_transcript = ""
-                                self.first_final_time = 0.0
-                                logger.info(f"[TurnSM] Turn COMMITTED (after {int(wait_s*1000)}ms wait): '{text_to_commit}'")
-                                await self.cancel_llm_tts()
-                                self.llm_tts_task = asyncio.create_task(
-                                    self.run_llm_tts_pipeline(text_to_commit)
-                                )
-                            except asyncio.CancelledError:
-                                pass
-
-                        if adaptive_wait == 0.0:
-                            self.turn_commit_task = asyncio.create_task(_do_commit_turn(0.0, candidate_text))
-                        else:
-                            self.turn_commit_task = asyncio.create_task(_do_commit_turn(adaptive_wait, candidate_text))
-
-                elif event_type == EVT_UTTERANCE_END:
-                    continue
+                    elif event_type == EVT_UTTERANCE_END:
+                        if self.accumulated_transcript.strip():
+                            logger.info("[TurnSM] EVT_UTTERANCE_END with non-empty accumulator -> immediate commit")
+                            self._schedule_commit(0.0)
 
                 elif event_type == EVT_ERROR:
                     logger.error(f'[STT error] {payload}')
@@ -1318,28 +1694,49 @@ class AsteriskVoiceSession:
         try:
             while True:
                 msg_type, payload = await read_packet(self.reader)
-                if msg_type in (0, 2):
+                if msg_type == 0:
                     logger.audiosocket_connection_closed("hangup")
+                    if self.diag:
+                        self.diag.socket_close_reason = "remote_hangup_msg0"
                     break
-                elif msg_type in (255, 3):
+                elif msg_type == 255:
                     logger.error(f'[AudioSocket] Error packet received ({msg_type}) for {self.call_uuid}: {payload}')
                     diagnostics.add_error("error", "audiosocket", f"AudioSocket error packet received: {payload}")
+                    if self.diag:
+                        self.diag.socket_close_reason = f"error_packet_255_{payload.hex() if payload else ''}"
                     break
-                elif msg_type == 4:
+                elif msg_type == 3:
+                    # DTMF digit from caller/Asterisk
+                    digit = payload.decode('ascii', errors='ignore') if payload else ''
+                    logger.info(f'[AudioSocket] DTMF received for {self.call_uuid}: {digit}')
+                    continue
+                elif msg_type in (2, 4):
+                    # Silence / Keepalive / Unassigned
                     continue
                 elif msg_type in (16, 1):
-                    if len(payload) > 0:
+                    if len(payload) > 0 and msg_type == 16:
                         self.last_audio_energy = calculate_pcm_rms(payload)
                         if self.stt_task is None or self.stt_task.done():
                             logger.warning('[AudioSocket] STT task was done/dead - restarting')
                             self.stt_task = asyncio.create_task(self.stt_loop())
                         try:
                             self.audio_queue.put_nowait(payload)
-                            diagnostics.update_session_state(
-                                self.call_uuid,
-                                state=self._state,
-                                audio_received=len(payload)
-                            )
+                            self._packet_count = getattr(self, '_packet_count', 0) + 1
+                            if self.diag:
+                                self.diag.audiosocket_frames_received += 1
+                                if self.diag.t_first_caller_pcm_ms is None:
+                                    self.diag.t_first_caller_pcm_ms = (time.monotonic() - self.diag.t_start) * 1000
+                            if self._packet_count == 1:
+                                logger.info(f'[AudioSocket] First audio frame received from Asterisk: {len(payload)} bytes, rms={self.last_audio_energy:.0f}')
+                            elif self._packet_count % 100 == 0:
+                                logger.info(f'[AudioSocket] Audio flowing: {self._packet_count} packets received from Asterisk, rms={self.last_audio_energy:.0f}')
+                            # Update diagnostics once per second (every 50 packets) to reduce event-loop overhead
+                            if self._packet_count % 50 == 0:
+                                diagnostics.update_session_state(
+                                    self.call_uuid,
+                                    state=self._state,
+                                    audio_received=len(payload) * 50
+                                )
                         except asyncio.QueueFull:
                             pass
                 else:
@@ -1395,6 +1792,7 @@ class AsteriskAudioSocketServer:
         logger.audiosocket_connection_accepted(peer[0], peer[1])
         call_uuid = None
         session = None
+        diag = None
         try:
             logger.uuid_read_started()
             msg_type, payload = await read_packet(reader)
@@ -1416,6 +1814,8 @@ class AsteriskAudioSocketServer:
                 await writer.wait_closed()
                 return
 
+            diag = CallMediaDiagnostics(call_uuid)
+            diag.uuid_packet_received = True
             logger.uuid_received(call_uuid)
             logger.set_context(session_uuid=call_uuid)
             
@@ -1423,11 +1823,15 @@ class AsteriskAudioSocketServer:
             context = await call_session_manager.get_call_context(call_uuid)
             if not context:
                 logger.agent_not_found(call_uuid)
+                diag.session_found = False
+                diag.socket_close_reason = "agent_not_found_in_session_manager"
+                logger.info(f"[MEDIA_DIAGNOSTICS] Summary for {call_uuid}: {json.dumps(diag.dump_summary())}")
                 diagnostics.add_error("error", "audiosocket", f"Failed to find registered call details for {call_uuid}")
                 writer.close()
                 await writer.wait_closed()
                 return
 
+            diag.session_found = True
             direction = context.get("direction", "inbound")
             caller = context.get("caller_id") or ""
             callee = context.get("dialed_number") or ""
@@ -1447,7 +1851,7 @@ class AsteriskAudioSocketServer:
                 agent_id=agent_id
             )
 
-            session = AsteriskVoiceSession(reader, writer, call_uuid, context)
+            session = AsteriskVoiceSession(reader, writer, call_uuid, context, diag=diag)
             call_session_manager.register_cleanup_callback(call_uuid, session.close_from_manager)
             call_session_manager.start_audio_session(call_uuid)
             self.active_connections[call_uuid] = asyncio.current_task()
@@ -1455,6 +1859,8 @@ class AsteriskAudioSocketServer:
             from app.services.call_admission_control import run_live_call_monitor
             async def hangup_callback(reason: str):
                 logger.warning(f"[AudioSocket] Hangup triggered by monitor for call {call_uuid}: reason={reason}")
+                if diag:
+                    diag.session_cleanup_reason = f"cac_monitor_{reason}"
                 try:
                     db = get_supabase_client()
                     db.table("calls").update({
@@ -1472,22 +1878,34 @@ class AsteriskAudioSocketServer:
                 finally:
                     monitor_task.cancel()
             except asyncio.CancelledError:
+                if diag:
+                    diag.socket_close_reason = "cancelled_error"
                 logger.audiosocket_connection_closed("cancelled")
             except (asyncio.IncompleteReadError, ConnectionError, BrokenPipeError, ConnectionResetError) as e:
+                if diag:
+                    diag.socket_close_reason = f"client_disconnect_{type(e).__name__}"
                 logger.info(f"[AudioSocket] Client disconnected normally during session: {e}")
             except Exception as e:
+                if diag:
+                    diag.socket_close_reason = f"exception_{type(e).__name__}_{e}"
                 logger.audiosocket_connection_error(e, "session_run")
                 diagnostics.add_error("error", "audiosocket", f"Session run error: {str(e)}")
 
         except (asyncio.IncompleteReadError, ConnectionError, BrokenPipeError, ConnectionResetError) as e:
+            if diag:
+                diag.socket_close_reason = f"handshake_disconnect_{type(e).__name__}"
             if "closed cleanly" in str(e):
                 logger.info(f"[AudioSocket] Port probe or clean disconnect during handshake: {e}")
             else:
                 logger.info(f"[AudioSocket] Client disconnected normally during handshake: {e}")
         except Exception as e:
+            if diag:
+                diag.socket_close_reason = f"handshake_error_{type(e).__name__}_{e}"
             logger.error(f"[AudioSocket] Unexpected error in handle_connection: {e}", exc_info=True)
             diagnostics.add_error("error", "audiosocket", f"Unexpected connection error: {str(e)}")
         finally:
+            if diag:
+                logger.info(f"[MEDIA_DIAGNOSTICS] Summary for {call_uuid}: {json.dumps(diag.dump_summary())}")
             if call_uuid:
                 self.active_connections.pop(call_uuid, None)
                 from app.services.call_session_manager import call_session_manager
@@ -1529,7 +1947,11 @@ async def _monitor_event_loop_lag():
             actual = time.monotonic() - t0
             lag_ms = (actual - 0.100) * 1000
             if lag_ms > 20.0:
-                logger.warning(f"[EventLoopLag] High asyncio loop lag detected: {lag_ms:.1f}ms")
+                active_count = len(_audiosocket_server.active_connections) if _audiosocket_server else 0
+                if lag_ms > 50.0:
+                    logger.warning(f"[EventLoopLag] High asyncio loop lag: {lag_ms:.1f}ms (Active calls: {active_count})")
+                else:
+                    logger.info(f"[EventLoopLag] Loop lag: {lag_ms:.1f}ms (Active calls: {active_count})")
         except asyncio.CancelledError:
             break
         except Exception:

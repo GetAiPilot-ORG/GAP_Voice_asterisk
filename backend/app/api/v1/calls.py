@@ -6,6 +6,7 @@ from app.services.telephony_service import TelephonyService
 import logging
 import subprocess
 import shlex
+import re
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -17,6 +18,32 @@ def execute_asterisk_cli(asterisk_cmd: str) -> Dict[str, Any]:
     """
     from app.services.asterisk_cli import execute_asterisk_cli_cmd
     return execute_asterisk_cli_cmd(asterisk_cmd)
+
+
+def format_pstn_dial_number(dial_number: str, provider_type: str = "custom") -> str:
+    """
+    Normalizes dial numbers according to telecom provider rules.
+    Indian SIP Trunks (24IT Hub / ConnexCS / Tata / Airtel) require national STD format: 0XXXXXXXXXX.
+    """
+    dial_number = dial_number.strip()
+    if provider_type == "twilio":
+        if not dial_number.startswith("+"):
+            return "+" + dial_number
+        return dial_number
+
+    clean_digits = re.sub(r"\D", "", dial_number)
+    if clean_digits.startswith("91") and len(clean_digits) == 12:
+        # Indian 10-digit mobile with 91 country code -> convert to 0 + 10 digits
+        return "0" + clean_digits[2:]
+    elif len(clean_digits) == 10:
+        # 10-digit Indian mobile -> prepend 0
+        return "0" + clean_digits
+    elif clean_digits.startswith("0") and len(clean_digits) == 11:
+        # Already formatted with STD 0 prefix
+        return clean_digits
+    elif dial_number.startswith("+"):
+        return dial_number[1:]
+    return dial_number
 
 
 def is_audiosocket_listening() -> bool:
@@ -234,11 +261,12 @@ async def test_call(
     db: Client = Depends(get_db),
 ):
     """Place an outbound test call to verify an agent's telephony integration."""
-    to_number: str = body.get("to_number", "").strip()
-    if not to_number:
+    raw_to: str = body.get("to_number", "").strip()
+    if not raw_to:
         raise HTTPException(status_code=400, detail="to_number is required")
         
-    # Ensure to_number starts with '+' to conform to E.164 preflight safety regex
+    # Sanitize whitespace, dashes, parens, and ensure leading '+' for E.164 compliance
+    to_number = re.sub(r"[\s\-\(\)\.]+", "", raw_to)
     if not to_number.startswith("+"):
         to_number = "+" + to_number
 
@@ -370,7 +398,8 @@ async def test_call(
             dialed_number=to_number,
             workspace_id=str(workspace_id),
             agent_id=str(agent_id),
-            phone_number_id=str(did_number_id) if did_number_id else ""
+            phone_number_id=str(did_number_id) if did_number_id else "",
+            direction="outbound"
         )
         
         # Insert call record in DB
@@ -410,20 +439,15 @@ async def test_call(
         except Exception:
             provider_type = "custom"
             
-        if provider_type != "twilio":
-            # 24IThub and Indian SIP trunks require 91XXXXXXXXXX without '+' prefix
-            if dial_number.startswith('+'):
-                dial_number = dial_number[1:]
-        else:
-            if not dial_number.startswith('+'):
-                dial_number = '+' + dial_number
+        dial_number = format_pstn_dial_number(dial_number, provider_type)
                 
         endpoint_name = f"provider-{trunk_id}"
         caller_id = from_number or "911168140253"
         if caller_id.startswith('+'):
             caller_id = caller_id[1:]
 
-        originate_cmd_str = f"asterisk -rx 'channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}'"
+        # Answer-gated originate: Local channel sets CLI/PAI, executes outbound-ai-answered ONLY upon answer
+        originate_cmd_str = f"asterisk -rx 'channel originate Local/{dial_number}@outbound-dial-carrier extension {call_id}@outbound-ai-answered'"
 
         call_originated = False
 
@@ -441,6 +465,15 @@ async def test_call(
                 from app.services.asterisk_cli import verify_endpoint_status
                 validation = verify_endpoint_status(endpoint_name)
                 if validation["status"] == "missing":
+                    for fallback_name in ["provider-24ithub", "provider-trunk"]:
+                        fallback_check = verify_endpoint_status(fallback_name)
+                        if fallback_check["status"] == "valid":
+                            logger.info(f"[Asterisk Test Call] Endpoint '{endpoint_name}' not found, falling back to valid endpoint '{fallback_name}'")
+                            endpoint_name = fallback_name
+                            validation = fallback_check
+                            break
+
+                if validation["status"] == "missing":
                     raise HTTPException(
                         status_code=400,
                         detail=validation["message"]
@@ -451,8 +484,8 @@ async def test_call(
                         detail=f"Asterisk connection issue: {validation['message']}"
                     )
                     
-                # 3. Execute local originate command directly (no SSH fallback, return errors)
-                originate_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}"
+                # 3. Execute answer-gated originate directly
+                originate_cmd = f"channel originate Local/{dial_number}@outbound-dial-carrier extension {call_id}@outbound-ai-answered"
                 res = execute_asterisk_cli(originate_cmd)
                 if res["returncode"] != 0:
                     raise HTTPException(
@@ -530,7 +563,7 @@ async def test_call(
                         ssh_cmd += ["-i", ssh_key]
                     ssh_cmd += [
                         f"{ssh_user}@{ssh_host}",
-                        f"asterisk -rx 'channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}'"
+                        f"asterisk -rx 'channel originate Local/{dial_number}@outbound-dial-carrier extension {call_id}@outbound-ai-answered'"
                     ]
                     try:
                         # Increased timeout to 60 seconds to accommodate network/routing latency
@@ -546,11 +579,11 @@ async def test_call(
                 # Strategy 3: Run asterisk locally (only if not on Windows or as last resort local fallback)
                 if not call_originated:
                     import platform
+                    orig_cmd = f"channel originate Local/{dial_number}@outbound-dial-carrier extension {call_id}@outbound-ai-answered"
                     if platform.system() == "Windows":
-                        orig_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}"
                         cmd = ["wsl", "-u", "root", "bash", "-c", f"asterisk -rx {shlex.quote(orig_cmd)}"]
                     else:
-                        cmd = ["asterisk", "-rx", f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_id},127.0.0.1:{settings.asterisk_audiosocket_port}"]
+                        cmd = ["asterisk", "-rx", orig_cmd]
                     try:
                         # Increased timeout to 60 seconds to accommodate slow WSL start/execution latency
                         res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -682,7 +715,10 @@ async def asterisk_outbound_call(body: Dict[str, Any], db: Client = Depends(get_
     Accepts an optional call_id and trunk_id when called from the test-call endpoint
     (so the UUID stays consistent between the registered session and the originate command).
     """
-    to_number = body.get("to_number", "").strip()
+    raw_to = body.get("to_number", "").strip()
+    to_number = re.sub(r"[\s\-\(\)\.]+", "", raw_to)
+    if to_number and not to_number.startswith("+"):
+        to_number = "+" + to_number
     from_number = body.get("from_number", "").strip()
     workspace_id = body.get("workspace_id", "").strip()
     agent_id = body.get("agent_id", "").strip()
@@ -860,7 +896,8 @@ async def asterisk_outbound_call(body: Dict[str, Any], db: Client = Depends(get_
             dialed_number=to_number,
             workspace_id=str(workspace_id),
             agent_id=str(agent_id),
-            phone_number_id=str(phone_id) if phone_id else ""
+            phone_number_id=str(phone_id) if phone_id else "",
+            direction="outbound"
         )
 
         from datetime import datetime, timezone
@@ -900,19 +937,15 @@ async def asterisk_outbound_call(body: Dict[str, Any], db: Client = Depends(get_
     except Exception:
         provider_type = "custom"
         
-    if provider_type != "twilio":
-        if dial_number.startswith('+'):
-            if dial_number.startswith('+91'):
-                dial_number = dial_number[1:]
-                
-    # Ensure dial_number has '+' prefix
-    if not dial_number.startswith('+'):
-        dial_number = '+' + dial_number
+    dial_number = format_pstn_dial_number(dial_number, provider_type)
             
     endpoint_name = f"provider-{trunk_id}"
-    caller_id = from_number or "+18166536732"
+    caller_id = from_number or "911168140253"
+    if caller_id.startswith('+'):
+        caller_id = caller_id[1:]
 
-    orig_cmd = f"channel originate Local/{caller_id}*{trunk_id}*{dial_number}@outbound-local/n application AudioSocket {call_uuid},127.0.0.1:{settings.asterisk_audiosocket_port}"
+    # Answer-gated originate: Local channel sets CLI/PAI, executes outbound-ai-answered ONLY upon answer
+    orig_cmd = f"channel originate Local/{dial_number}@outbound-dial-carrier extension {call_uuid}@outbound-ai-answered"
 
     call_originated = False
 
@@ -999,13 +1032,15 @@ async def asterisk_diagnostics():
     
     detected_errors = []
     
-    # 1. Check AudioSocket 9092
+    # 1. Check AudioSocket listener
     audiosocket_listening = False
+    as_host = settings.asterisk_audiosocket_host or "127.0.0.1"
+    as_port = settings.asterisk_audiosocket_port or 9092
     try:
-        with socket.create_connection(("127.0.0.1", 9092), timeout=1.0) as s:
+        with socket.create_connection((as_host, as_port), timeout=1.0) as s:
             audiosocket_listening = True
     except Exception as e:
-        detected_errors.append(f"AudioSocket not listening on 9092: {e}")
+        detected_errors.append(f"AudioSocket not listening on {as_host}:{as_port}: {e}")
         
     # 2. Check Asterisk CLI Execution
     can_execute = False

@@ -34,10 +34,11 @@ async def run_asterisk_startup_checks():
     
     # 1. Check AudioSocket listener
     from app.api.v1.calls import is_audiosocket_listening
+    as_port = settings.asterisk_audiosocket_port or 9092
     if is_audiosocket_listening():
-        logger.info("[Startup Check] AudioSocket TCP listener is ACTIVE on 127.0.0.1:9092")
+        logger.info(f"[Startup Check] AudioSocket TCP listener is ACTIVE on 127.0.0.1:{as_port}")
     else:
-        logger.warning("[Startup Check] AudioSocket TCP listener is NOT active on 127.0.0.1:9092. Outbound calls will fail locally!")
+        logger.warning(f"[Startup Check] AudioSocket TCP listener is NOT active on 127.0.0.1:{as_port}. Outbound calls will fail locally!")
         
     # 2. Check Asterisk CLI availability
     from app.services.asterisk_cli import execute_asterisk_cli_cmd
@@ -69,6 +70,10 @@ async def lifespan(app: FastAPI):
     # Start the local scheduler loop in the background
     asyncio.create_task(start_local_scheduler())
 
+    # Start OpenAI LLM connection pool keep-warm task
+    from app.services.llm_service import start_llm_keep_warm, stop_llm_keep_warm
+    start_llm_keep_warm()
+
     # Start Asterisk startup diagnostic checks in the background
     asyncio.create_task(run_asterisk_startup_checks())
 
@@ -83,6 +88,13 @@ async def lifespan(app: FastAPI):
         )
 
     yield
+
+    # Stop OpenAI keep-warm task
+    try:
+        from app.services.llm_service import stop_llm_keep_warm
+        stop_llm_keep_warm()
+    except Exception:
+        pass
 
     # Stop the Audiosocket TCP server gracefully on server shutdown.
     if settings.asterisk_audiosocket_enabled:

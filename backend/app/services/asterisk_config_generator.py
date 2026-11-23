@@ -191,6 +191,7 @@ class AsteriskConfigGenerator:
             " same => n,Set(CALLERID(all)=\"${TARGET_CLI}\" <${TARGET_CLI}>)",
             " same => n,Set(CALLERID(num)=${TARGET_CLI})",
             " same => n,Set(CALLERID(name)=${TARGET_CLI})",
+            " same => n,Set(CALLERID(pres)=allowed)",
             " same => n,Dial(PJSIP/${TARGET_NUM}@${TARGET_TRUNK},60,b(outbound-predial-handler^s^1))",
             " same => n,Hangup()",
             "",

@@ -16,7 +16,7 @@ TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 echo "[1/7] Backing up existing Asterisk configurations..."
 mkdir -p /etc/asterisk/backups
-for cfg in pjsip.conf extensions.conf rtp.conf modules.conf; do
+for cfg in pjsip.conf extensions.conf rtp.conf modules.conf manager.conf; do
     if [ -f "/etc/asterisk/$cfg" ]; then
         cp "/etc/asterisk/$cfg" "/etc/asterisk/backups/${cfg}.${TIMESTAMP}.bak"
         echo "  Backed up /etc/asterisk/$cfg -> /etc/asterisk/backups/${cfg}.${TIMESTAMP}.bak"
@@ -28,6 +28,9 @@ cp "$SCRIPT_DIR/asterisk/pjsip.conf" /etc/asterisk/pjsip.conf
 cp "$SCRIPT_DIR/asterisk/extensions.conf" /etc/asterisk/extensions.conf
 cp "$SCRIPT_DIR/asterisk/rtp.conf" /etc/asterisk/rtp.conf
 cp "$SCRIPT_DIR/asterisk/modules.conf" /etc/asterisk/modules.conf
+if [ -f "$SCRIPT_DIR/asterisk/manager.conf" ]; then
+    cp "$SCRIPT_DIR/asterisk/manager.conf" /etc/asterisk/manager.conf
+fi
 
 chown -R asterisk:asterisk /etc/asterisk/ || chown -R root:root /etc/asterisk/
 chmod 640 /etc/asterisk/*.conf
@@ -53,6 +56,7 @@ asterisk -rx "core reload" || true
 asterisk -rx "pjsip reload"
 asterisk -rx "dialplan reload"
 asterisk -rx "module reload res_rtp_asterisk" || true
+asterisk -rx "manager reload" || true
 
 echo "[5/7] Installing FastAPI Backend systemd service..."
 cp "$SCRIPT_DIR/systemd/fastapi-backend.service" /etc/systemd/system/fastapi-backend.service

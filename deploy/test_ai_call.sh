@@ -54,6 +54,11 @@ if [ -f "/root/asterisk/deploy/asterisk/extensions.conf" ]; then
     asterisk -rx "dialplan reload"
     echo "  [OK] Dialplan reloaded."
 fi
+if [ -f "/root/asterisk/deploy/asterisk/manager.conf" ]; then
+    cp /root/asterisk/deploy/asterisk/manager.conf /etc/asterisk/manager.conf
+    asterisk -rx "manager reload" 2>/dev/null || true
+    echo "  [OK] Manager (AMI) reloaded."
+fi
 
 echo ""
 echo "[3/4] Generating Workspace Admin Auth Token & Triggering Call:"

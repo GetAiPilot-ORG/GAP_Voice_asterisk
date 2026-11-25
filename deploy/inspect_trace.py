@@ -27,6 +27,10 @@ def parse_pcap(pcap_path):
         print(f"Unknown PCAP magic: {magic.hex()}")
         endian = '<'
 
+    # Link-layer header type is at bytes 20:24
+    link_type = struct.unpack(endian + 'I', pcap_data[20:24])[0]
+    print(f"PCAP Link-layer header type (DLT): {link_type}")
+
     offset = 24
     packets = []
     while offset + 16 <= len(pcap_data):
@@ -41,25 +45,24 @@ def parse_pcap(pcap_path):
 
     print(f"Total Raw Packets Captured: {len(packets)}")
 
-    # Parse SIP and RTP packets
     sip_messages = []
     rtp_packets = []
 
     for ts, raw in packets:
-        # Check link layer (Ethernet is 14 bytes, Linux Cooked SLL is 16 bytes)
-        ip_offset = 0
-        if raw.startswith(b'\x00\x00') or raw.startswith(b'\x00\x04'):
-            ip_offset = 16  # SLL
-        elif len(raw) > 14 and raw[12:14] == b'\x08\x00':
-            ip_offset = 14  # Ethernet IPv4
+        ip_offset = None
+        if link_type == 113:
+            ip_offset = 16
+        elif link_type == 276:
+            ip_offset = 20
+        elif link_type == 1:
+            ip_offset = 14
         else:
-            # Try to find IPv4 header (0x45)
-            for trial in [0, 14, 16]:
-                if len(raw) > trial and (raw[trial] & 0xF0) == 0x40:
+            for trial in [16, 20, 14, 0]:
+                if len(raw) > trial + 20 and (raw[trial] & 0xF0) == 0x40 and (raw[trial] & 0x0F) >= 5:
                     ip_offset = trial
                     break
 
-        if len(raw) < ip_offset + 20:
+        if ip_offset is None or len(raw) < ip_offset + 20:
             continue
 
         ip_hdr = raw[ip_offset:ip_offset+20]
@@ -85,12 +88,11 @@ def parse_pcap(pcap_path):
         if not payload:
             continue
 
-        # Check for SIP text
-        if any(payload.startswith(sig) for sig in [b'INVITE', b'SIP/2.0', b'ACK', b'BYE', b'CANCEL']):
+        # Check for SIP text (port 5060 or SIP keywords)
+        if src_port == 5060 or dst_port == 5060 or any(payload.startswith(sig) for sig in [b'INVITE', b'SIP/2.0', b'ACK', b'BYE', b'CANCEL']):
             sip_messages.append((ts, src_ip, src_port, dst_ip, dst_port, payload.decode(errors='ignore')))
-        elif (src_port in range(10000, 20001) or dst_port in range(10000, 20001) or
-              src_port in range(16000, 25000) or dst_port in range(16000, 25000)):
-            # Potential RTP packet
+        elif (src_port in range(10000, 25000) or dst_port in range(10000, 25000)):
+            # RTP packet
             if len(payload) >= 12 and (payload[0] & 0xC0) == 0x80:
                 v = payload[0] >> 6
                 p = (payload[0] >> 5) & 1

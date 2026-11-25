@@ -236,11 +236,17 @@ def run_voice_call(task_id: str, payload: Dict[str, Any], attempt: int = 1):
                     if validation["status"] != "valid":
                         raise ValueError(validation["message"])
 
-                    # Answer-gated originate: Local channel sets CLI/PAI, executes outbound-ai-answered ONLY upon answer
-                    orig_cmd = f"channel originate Local/{dial_number}@outbound-dial-carrier/n extension {call_id}@outbound-ai-answered"
-                    res = execute_asterisk_cli(orig_cmd)
-                    if res["returncode"] != 0:
-                        raise ValueError(f"Asterisk local originate failed (code {res['returncode']}): {res['stderr'] or res['stdout']}")
+                    # Execute originate via unified Asterisk originate service (AMI -> Callfile -> CLI fallback)
+                    from app.services.asterisk_originate_service import originate_service
+                    orig_res = run_async(originate_service.originate_call(
+                        dial_number=dial_number,
+                        call_uuid=call_id,
+                        caller_id=caller_id,
+                        trunk_id=str(trunk_id),
+                        carrier_domain=settings.asterisk_default_carrier_domain,
+                    ))
+                    if not orig_res.success:
+                        raise ValueError(f"Asterisk originate failed ({orig_res.mode_used}): {orig_res.error}")
                     call_originated = True
                 else:
                     # Strategy 1: VPS HTTP API
@@ -295,7 +301,7 @@ def run_voice_call(task_id: str, payload: Dict[str, Any], attempt: int = 1):
                             ssh_cmd += ["-i", ssh_key]
                         ssh_cmd += [
                             f"{ssh_user}@{ssh_host}",
-                            f"asterisk -rx 'channel originate Local/{dial_number}@outbound-dial-carrier/n extension {call_id}@outbound-ai-answered'"
+                            f"asterisk -rx 'channel originate Local/{dial_number}@outbound-dial-carrier extension {call_id}@outbound-ai-answered'"
                         ]
                         try:
                             import subprocess
@@ -311,7 +317,7 @@ def run_voice_call(task_id: str, payload: Dict[str, Any], attempt: int = 1):
                     if not call_originated:
                         import platform
                         import shlex
-                        orig_cmd = f"channel originate Local/{dial_number}@outbound-dial-carrier/n extension {call_id}@outbound-ai-answered"
+                        orig_cmd = f"channel originate Local/{dial_number}@outbound-dial-carrier extension {call_id}@outbound-ai-answered"
                         if platform.system() == "Windows":
                             cmd = ["wsl", "-u", "root", "bash", "-c", f"asterisk -rx {shlex.quote(orig_cmd)}"]
                         else:

@@ -51,6 +51,22 @@ class Settings(BaseSettings):
     api_port: int = 8010
     api_workers: int = 1
     
+    # Asterisk Outbound Originate & AMI Configuration
+    outbound_originate_mode: str = "ami"  # Options: "ami" | "callfile" | "cli_local"
+    asterisk_ami_host: str = "127.0.0.1"
+    asterisk_ami_port: int = 5038
+    asterisk_ami_user: str = "voicepilot"
+    asterisk_ami_secret: str = "vp_ami_secret_production_2026"
+    asterisk_spool_outgoing_dir: str = "/var/spool/asterisk/outgoing"
+    asterisk_default_carrier_domain: str = "cpbx.24ithub.com"
+    asterisk_mode: str = "local"
+    asterisk_vps_url: Optional[str] = None
+    asterisk_ssh_host: str = "72.60.202.148"
+    asterisk_ssh_user: str = "root"
+    asterisk_ssh_key_path: Optional[str] = None
+    use_ssh_for_asterisk: bool = False
+    asterisk_test_beep_on_connect: bool = False
+    
     # App
     environment: str = "development"
     log_level: str = "INFO"

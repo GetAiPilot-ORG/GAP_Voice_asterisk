@@ -484,13 +484,19 @@ async def test_call(
                         detail=f"Asterisk connection issue: {validation['message']}"
                     )
                     
-                # 3. Execute answer-gated originate directly
-                originate_cmd = f"channel originate Local/{dial_number}@outbound-dial-carrier extension {call_id}@outbound-ai-answered"
-                res = execute_asterisk_cli(originate_cmd)
-                if res["returncode"] != 0:
+                # 3. Execute originate via unified Asterisk originate service (AMI -> Callfile -> CLI fallback)
+                from app.services.asterisk_originate_service import originate_service
+                orig_res = await originate_service.originate_call(
+                    dial_number=dial_number,
+                    call_uuid=call_id,
+                    caller_id=caller_id,
+                    trunk_id=str(trunk_id),
+                    carrier_domain=settings.asterisk_default_carrier_domain,
+                )
+                if not orig_res.success:
                     raise HTTPException(
                         status_code=500,
-                        detail=f"Asterisk local originate failed (code {res['returncode']}): {res['stderr'] or res['stdout']}. Command run: {res['full_cmd']}"
+                        detail=f"Asterisk originate failed ({orig_res.mode_used}): {orig_res.error}"
                     )
                 call_originated = True
 
@@ -966,12 +972,19 @@ async def asterisk_outbound_call(body: Dict[str, Any], db: Client = Depends(get_
                     detail=f"SIP Trunk Endpoint '{endpoint_name}' does not exist in Asterisk. Please check your pjsip.conf configuration."
                 )
                 
-            # 3. Execute local originate command directly
-            res = execute_asterisk_cli(orig_cmd)
-            if res["returncode"] != 0:
+            # 3. Execute originate via unified Asterisk originate service (AMI -> Callfile -> CLI fallback)
+            from app.services.asterisk_originate_service import originate_service
+            orig_res = await originate_service.originate_call(
+                dial_number=dial_number,
+                call_uuid=call_uuid,
+                caller_id=caller_id,
+                trunk_id=str(trunk_id),
+                carrier_domain=settings.asterisk_default_carrier_domain,
+            )
+            if not orig_res.success:
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Asterisk local originate failed (code {res['returncode']}): {res['stderr'] or res['stdout']}. Command run: {res['full_cmd']}"
+                    detail=f"Asterisk originate failed ({orig_res.mode_used}): {orig_res.error}"
                 )
             call_originated = True
         else:
@@ -979,9 +992,15 @@ async def asterisk_outbound_call(body: Dict[str, Any], db: Client = Depends(get_
             if not dial_number.startswith('+'):
                 dial_number = '+' + dial_number
             
-            # Execute using execute_asterisk_cli (which handles local/SSH configuration automatically)
-            res = execute_asterisk_cli(orig_cmd)
-            if res["returncode"] == 0:
+            from app.services.asterisk_originate_service import originate_service
+            orig_res = await originate_service.originate_call(
+                dial_number=dial_number,
+                call_uuid=call_uuid,
+                caller_id=caller_id,
+                trunk_id=str(trunk_id),
+                carrier_domain=settings.asterisk_default_carrier_domain,
+            )
+            if orig_res.success:
                 call_originated = True
 
     except Exception as orig_err:
